@@ -49,7 +49,7 @@ class VaultIndexer:
     def __init__(self, settings: BackendSettings | None = None) -> None:
         self._settings = settings or BackendSettings.from_env()
         self._settings.ensure_data_dirs()
-        self._settings.validate_openai()
+        self._settings.validate_llm()
         self._db = lancedb.connect(str(self._settings.vector_db_path))
         self._table = self._open_table()
 

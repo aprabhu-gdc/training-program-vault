@@ -17,7 +17,7 @@ The bot retrieves only from `wiki/`. The `raw/` folder is used for source captur
 - Local embedded vector index for `wiki/` content using LanceDB
 - Markdown-aware chunking by `##` headings
 - YAML frontmatter parsing and metadata propagation into index rows
-- OpenAI or Azure OpenAI support for embeddings and chat completion
+- Provider-agnostic LLM configuration with current runtime support for OpenAI and Azure OpenAI
 - Teams bot with typing indicators, welcome message, and feedback buttons
 - Teams manual `/sync` command for Egnyte refresh
 - Egnyte webhook endpoint for background ingest and reindexing
@@ -37,7 +37,7 @@ The bot retrieves only from `wiki/`. The `raw/` folder is used for source captur
 - `rag_backend/indexer.py` chunks `wiki/` pages and upserts the vector store
 - `rag_backend/query.py` performs retrieval and answer generation
 - `rag_backend/markdown.py` parses frontmatter and section structure
-- `rag_backend/llm.py` wraps OpenAI and Azure OpenAI calls
+- `rag_backend/llm.py` wraps the currently implemented LLM providers behind a generic config contract
 
 ### Sync and Ingest Layer
 
@@ -87,38 +87,58 @@ Attachment content is treated as user-supplied context, not as a wiki source. On
 
 ## Model Configuration
 
-This project does not assume a single model family or a single default vision model.
+The environment contract is provider-agnostic. You can configure one default provider or route chat, vision, and embeddings separately.
 
-### Standard OpenAI
-
-Required:
-
-- `OPENAI_API_KEY`
-- `OPENAI_CHAT_MODEL`
-- `OPENAI_EMBEDDING_MODEL`
-
-Optional:
-
-- `OPENAI_BASE_URL`
-- `OPENAI_VISION_MODEL`
-
-If `OPENAI_VISION_MODEL` is not set, image requests fall back to `OPENAI_CHAT_MODEL`. In that case, the selected chat model must support image input if you want Teams image attachments to work.
-
-### Azure OpenAI
+### Generic Routing Keys
 
 Required:
 
-- `AZURE_OPENAI_ENDPOINT`
-- `AZURE_OPENAI_API_KEY`
-- `AZURE_OPENAI_API_VERSION`
-- `AZURE_OPENAI_CHAT_DEPLOYMENT`
-- `AZURE_OPENAI_EMBEDDING_DEPLOYMENT`
+- `LLM_PROVIDER` or workload-specific provider keys
+- `LLM_CHAT_MODEL`
+- `LLM_EMBEDDING_MODEL`
 
 Optional:
 
-- `AZURE_OPENAI_VISION_DEPLOYMENT`
+- `LLM_CHAT_PROVIDER`
+- `LLM_VISION_PROVIDER`
+- `LLM_VISION_MODEL`
+- `LLM_EMBEDDING_PROVIDER`
 
-If `AZURE_OPENAI_VISION_DEPLOYMENT` is not set, image requests fall back to `AZURE_OPENAI_CHAT_DEPLOYMENT`. That deployment must support image input for image attachments to work.
+Routing behavior:
+
+- `LLM_CHAT_PROVIDER` falls back to `LLM_PROVIDER`
+- `LLM_VISION_PROVIDER` falls back to `LLM_CHAT_PROVIDER`, then `LLM_PROVIDER`
+- `LLM_EMBEDDING_PROVIDER` falls back to `LLM_PROVIDER`
+- `LLM_VISION_MODEL` falls back to `LLM_CHAT_MODEL`
+
+### Provider Credential Blocks
+
+- OpenAI-compatible:
+  - `LLM_OPENAI_API_KEY`
+  - `LLM_OPENAI_BASE_URL`
+- Azure OpenAI:
+  - `LLM_AZURE_OPENAI_ENDPOINT`
+  - `LLM_AZURE_OPENAI_API_KEY`
+  - `LLM_AZURE_OPENAI_API_VERSION`
+- Anthropic:
+  - `LLM_ANTHROPIC_API_KEY`
+  - `LLM_ANTHROPIC_BASE_URL`
+- Google:
+  - `LLM_GOOGLE_API_KEY`
+  - `LLM_GOOGLE_BASE_URL`
+
+### Current Runtime Support
+
+The configuration scheme is provider-agnostic, but the current implemented runtime adapters support these providers today:
+
+- `openai`
+- `azure-openai`
+
+`anthropic` and `google` can now be represented in configuration without renaming keys later, but they are not implemented in `rag_backend/llm.py` yet.
+
+### Vision Behavior
+
+If `LLM_VISION_MODEL` is not set, image requests fall back to `LLM_CHAT_MODEL`. In that case, the selected chat model must support image input if you want Teams image attachments to work.
 
 ## Environment Variables
 
@@ -141,8 +161,17 @@ See `.env.example` for the full list. The most important settings are:
   - `RAG_TOP_K`
   - `RAG_INDEX_SUMMARY_CHARS`
 - LLM and embedding config:
-  - `OPENAI_*`
-  - `AZURE_OPENAI_*`
+  - `LLM_PROVIDER`
+  - `LLM_CHAT_PROVIDER`
+  - `LLM_CHAT_MODEL`
+  - `LLM_VISION_PROVIDER`
+  - `LLM_VISION_MODEL`
+  - `LLM_EMBEDDING_PROVIDER`
+  - `LLM_EMBEDDING_MODEL`
+  - `LLM_OPENAI_*`
+  - `LLM_AZURE_OPENAI_*`
+  - `LLM_ANTHROPIC_*`
+  - `LLM_GOOGLE_*`
 - Egnyte sync:
   - `EGNYTE_DOMAIN`
   - `EGNYTE_API_TOKEN`

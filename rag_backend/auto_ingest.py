@@ -45,7 +45,7 @@ class AutoIngestService:
     def __init__(self, settings: BackendSettings | None = None) -> None:
         self._settings = settings or BackendSettings.from_env()
         self._settings.ensure_data_dirs()
-        self._settings.validate_openai()
+        self._settings.validate_llm()
         self._indexer = VaultIndexer(self._settings)
 
     def sync_from_webhook(self, payload: dict[str, Any]) -> SyncReport:

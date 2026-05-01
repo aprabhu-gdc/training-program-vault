@@ -191,7 +191,7 @@ async def query_vault(query: str, request_id: str, **kwargs) -> str:
     """Retrieve wiki chunks, call the LLM, and return a cited answer string."""
 
     settings = BackendSettings.from_env()
-    settings.validate_openai()
+    settings.validate_llm()
 
     table = _open_table(settings)
     if table is None or table.count_rows() == 0:

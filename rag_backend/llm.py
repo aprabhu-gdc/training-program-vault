@@ -1,4 +1,8 @@
-"""OpenAI and Azure OpenAI helpers for retrieval and ingestion."""
+"""LLM helpers for retrieval and ingestion.
+
+The environment contract is provider-agnostic, but the current runtime
+implementation supports `openai` and `azure-openai` providers.
+"""
 
 from __future__ import annotations
 
@@ -21,46 +25,38 @@ def _batched(values: Sequence[str], size: int = 64) -> Iterable[list[str]]:
 
 
 def _chat_model(settings: BackendSettings, *, requires_vision: bool = False) -> str:
-    if settings.uses_azure_openai:
-        if requires_vision and settings.azure_openai_vision_deployment:
-            return settings.azure_openai_vision_deployment
-        return settings.azure_openai_chat_deployment
-    if requires_vision and settings.openai_vision_model:
-        return settings.openai_vision_model
-    return settings.openai_chat_model
+    return settings.resolved_vision_model if requires_vision else settings.resolved_chat_model
 
 
 def _embedding_model(settings: BackendSettings) -> str:
-    if settings.uses_azure_openai:
-        return settings.azure_openai_embedding_deployment
-    return settings.openai_embedding_model
+    return settings.resolved_embedding_model
 
 
 def create_sync_client(settings: BackendSettings) -> OpenAI | AzureOpenAI:
-    if settings.uses_azure_openai:
+    if settings.chat_provider == "azure-openai":
         return AzureOpenAI(
-            api_key=settings.azure_openai_api_key,
-            azure_endpoint=settings.azure_openai_endpoint,
-            api_version=settings.azure_openai_api_version,
+            api_key=settings.llm_azure_openai_api_key,
+            azure_endpoint=settings.llm_azure_openai_endpoint,
+            api_version=settings.llm_azure_openai_api_version,
         )
 
-    kwargs = {"api_key": settings.openai_api_key}
-    if settings.openai_base_url:
-        kwargs["base_url"] = settings.openai_base_url
+    kwargs = {"api_key": settings.llm_openai_api_key}
+    if settings.llm_openai_base_url:
+        kwargs["base_url"] = settings.llm_openai_base_url
     return OpenAI(**kwargs)
 
 
 def create_async_client(settings: BackendSettings) -> AsyncOpenAI | AsyncAzureOpenAI:
-    if settings.uses_azure_openai:
+    if settings.chat_provider == "azure-openai":
         return AsyncAzureOpenAI(
-            api_key=settings.azure_openai_api_key,
-            azure_endpoint=settings.azure_openai_endpoint,
-            api_version=settings.azure_openai_api_version,
+            api_key=settings.llm_azure_openai_api_key,
+            azure_endpoint=settings.llm_azure_openai_endpoint,
+            api_version=settings.llm_azure_openai_api_version,
         )
 
-    kwargs = {"api_key": settings.openai_api_key}
-    if settings.openai_base_url:
-        kwargs["base_url"] = settings.openai_base_url
+    kwargs = {"api_key": settings.llm_openai_api_key}
+    if settings.llm_openai_base_url:
+        kwargs["base_url"] = settings.llm_openai_base_url
     return AsyncOpenAI(**kwargs)
 
 
