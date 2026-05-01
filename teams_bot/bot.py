@@ -7,12 +7,14 @@ import contextlib
 import logging
 import re
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from botbuilder.core import ConversationState, TurnContext, UserState
 from botbuilder.core.teams import TeamsActivityHandler
 from botbuilder.schema import Activity, ActivityTypes, InvokeResponse
 
+from rag_backend.auto_ingest import SyncReport
 from teams_bot.cards import build_feedback_card
 from teams_bot.config import Settings
 from teams_bot.services.feedback import FeedbackEvent, FeedbackLogger
@@ -33,6 +35,7 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         conversation_state: ConversationState,
         wiki_query_service: WikiQueryService,
         feedback_logger: FeedbackLogger,
+        sync_runner: Callable[[str, dict[str, Any] | None], Awaitable[SyncReport]],
     ) -> None:
         super().__init__()
         self._settings = settings
@@ -40,6 +43,7 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         self._conversation_state = conversation_state
         self._wiki_query_service = wiki_query_service
         self._feedback_logger = feedback_logger
+        self._sync_runner = sync_runner
         # Use a simple boolean property rather than a custom object so the state
         # remains JSON-serializable across real storage providers.
         self._welcome_accessor = self._user_state.create_property("HasSeenWelcome")
@@ -85,6 +89,10 @@ class GraydazeTrainingBot(TeamsActivityHandler):
                 await turn_context.send_activity(
                     "Send me a training question and I’ll search the Graydaze PM Training Vault for you."
                 )
+                return
+
+            if self._is_sync_command(query_text):
+                await self._handle_sync_command(turn_context)
                 return
 
             request_id = uuid.uuid4().hex[:12]
@@ -193,6 +201,29 @@ class GraydazeTrainingBot(TeamsActivityHandler):
 
         await turn_context.send_activity("Thanks for the feedback.")
 
+    async def _handle_sync_command(self, turn_context: TurnContext) -> None:
+        """Trigger a manual Egnyte sync instead of querying the RAG pipeline."""
+
+        await turn_context.send_activity("Syncing with Egnyte. I’ll post the result here when it finishes.")
+        try:
+            report = await self._sync_runner("teams-manual-sync", None)
+        except Exception:
+            LOGGER.exception("Manual Teams sync failed")
+            await turn_context.send_activity(
+                "Syncing with Egnyte failed before the wiki could be refreshed. Check the app logs for details."
+            )
+            return
+
+        message = (
+            "Syncing with Egnyte complete. "
+            f"{len(report.downloaded_files)} files updated, "
+            f"{len(report.updated_wiki_files)} wiki files changed, and "
+            f"{len(report.index_report.indexed_files)} wiki files were re-indexed."
+        )
+        if report.skipped_files:
+            message += f" {len(report.skipped_files)} files were unchanged and skipped."
+        await turn_context.send_activity(message)
+
     def _is_feedback_submission(self, activity: Activity) -> bool:
         """Return True when the inbound activity is one of our feedback button clicks."""
 
@@ -223,6 +254,11 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         text = re.sub(r"<at>.*?</at>", "", text, flags=re.IGNORECASE)
         text = text.replace("&nbsp;", " ")
         return text.strip()
+
+    @staticmethod
+    def _is_sync_command(text: str) -> bool:
+        normalized = text.strip().lower()
+        return normalized == "/sync" or normalized.startswith("/sync ")
 
     async def _typing_loop(self, turn_context: TurnContext, interval_seconds: float = 3.0) -> None:
         """Send repeated typing indicators until the current operation completes."""

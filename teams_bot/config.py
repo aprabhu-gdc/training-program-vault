@@ -8,6 +8,8 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
+from rag_backend.config import BackendSettings
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -42,6 +44,7 @@ class Settings:
     wiki_query_http_url: str
     wiki_query_timeout_seconds: float
     welcome_examples: tuple[str, str]
+    backend: BackendSettings
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -51,7 +54,10 @@ class Settings:
             app_id=_read_env("MicrosoftAppId", "MICROSOFT_APP_ID"),
             app_password=_read_env("MicrosoftAppPassword", "MICROSOFT_APP_PASSWORD"),
             port=int(_read_env("PORT", default="3978")),
-            wiki_query_callable=_read_env("WIKI_QUERY_CALLABLE"),
+            wiki_query_callable=_read_env(
+                "WIKI_QUERY_CALLABLE",
+                default="rag_backend.query:query_vault",
+            ),
             wiki_query_http_url=_read_env("WIKI_QUERY_HTTP_URL"),
             wiki_query_timeout_seconds=float(
                 _read_env("WIKI_QUERY_TIMEOUT_SECONDS", default="45")
@@ -60,6 +66,7 @@ class Settings:
                 "What is an ETC and how often should I update it?",
                 "What should I do before a dump meeting?",
             ),
+            backend=BackendSettings.from_env(),
         )
 
     def validate(self) -> None:

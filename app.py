@@ -11,6 +11,7 @@ existing wiki query function through a configurable import path.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -26,6 +27,7 @@ from botbuilder.core import (
 )
 from botbuilder.schema import Activity
 
+from rag_backend.auto_ingest import AutoIngestService
 from teams_bot.bot import GraydazeTrainingBot
 from teams_bot.config import Settings
 from teams_bot.services.feedback import FeedbackLogger
@@ -70,6 +72,35 @@ def create_app() -> web.Application:
             timeout_seconds=settings.wiki_query_timeout_seconds,
         )
     feedback_logger = FeedbackLogger()
+    sync_service: AutoIngestService | None = None
+
+    async def run_sync_job(reason: str, payload: dict | None = None):
+        nonlocal sync_service
+        LOGGER.info("Starting background sync reason=%s", reason)
+        try:
+            if sync_service is None:
+                sync_service = AutoIngestService(settings.backend)
+            if payload is not None:
+                return await asyncio.to_thread(sync_service.sync_from_webhook, payload)
+            return await asyncio.to_thread(sync_service.sync_all_training_files)
+        except Exception:
+            LOGGER.exception("Background sync failed reason=%s", reason)
+            raise
+
+    def on_background_task_done(task: asyncio.Task) -> None:
+        app["background_tasks"].discard(task)
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            LOGGER.debug("Background task raised after completion callback", exc_info=True)
+
+    def schedule_background_sync(reason: str, payload: dict | None = None) -> asyncio.Task:
+        task = asyncio.create_task(run_sync_job(reason, payload))
+        task.add_done_callback(on_background_task_done)
+        app["background_tasks"].add(task)
+        return task
 
     bot = GraydazeTrainingBot(
         settings=settings,
@@ -77,6 +108,7 @@ def create_app() -> web.Application:
         conversation_state=conversation_state,
         wiki_query_service=wiki_query_service,
         feedback_logger=feedback_logger,
+        sync_runner=run_sync_job,
     )
 
     adapter_settings = BotFrameworkAdapterSettings(
@@ -148,9 +180,44 @@ def create_app() -> web.Application:
 
         return web.Response(status=201)
 
+    async def egnyte_webhook(request: web.Request) -> web.Response:
+        """Accept Egnyte change notifications and trigger background ingest."""
+
+        if request.content_type != "application/json":
+            return web.json_response(
+                {"error": "Only application/json payloads are supported."},
+                status=415,
+            )
+
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            LOGGER.warning("Rejected malformed JSON request on /api/webhooks/egnyte")
+            return web.json_response({"error": "Malformed JSON payload."}, status=400)
+
+        if not isinstance(payload, dict):
+            return web.json_response({"error": "Webhook payload must be a JSON object."}, status=400)
+
+        schedule_background_sync("egnyte-webhook", payload)
+        return web.json_response({"status": "accepted"}, status=202)
+
+    async def on_startup(app: web.Application) -> None:
+        app["background_tasks"] = set()
+
+    async def on_shutdown(app: web.Application) -> None:
+        tasks = list(app.get("background_tasks", set()))
+        if not tasks:
+            return
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     app = web.Application()
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
     app.router.add_get("/healthz", healthcheck)
     app.router.add_post("/api/messages", messages)
+    app.router.add_post("/api/webhooks/egnyte", egnyte_webhook)
     app["settings"] = settings
 
     LOGGER.info(
