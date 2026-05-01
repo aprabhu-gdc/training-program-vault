@@ -1,0 +1,66 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.17/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.17",
+  "version": "1.0.0",
+  "id": "__TEAMS_APP_ID__",
+  "packageName": "com.graydaze.pmtrainingvault",
+  "developer": {
+    "name": "Graydaze Contracting",
+    "websiteUrl": "https://graydaze.com",
+    "privacyUrl": "https://graydaze.com/privacy",
+    "termsOfUseUrl": "https://graydaze.com/terms"
+  },
+  "name": {
+    "short": "PM Training Vault",
+    "full": "Graydaze PM Training Vault"
+  },
+  "description": {
+    "short": "Ask Graydaze PM training questions in Microsoft Teams.",
+    "full": "Graydaze PM Training Vault lets junior PMs ask questions against the company training wiki directly inside Microsoft Teams."
+  },
+  "accentColor": "#F4B400",
+  "icons": {
+    "outline": "outline.png",
+    "color": "color.png"
+  },
+  "bots": [
+    {
+      "botId": "__BOT_APP_ID__",
+      "scopes": [
+        "personal",
+        "team"
+      ],
+      "supportsFiles": false,
+      "isNotificationOnly": false,
+      "commandLists": [
+        {
+          "scopes": [
+            "personal",
+            "team"
+          ],
+          "commands": [
+            {
+              "title": "help",
+              "description": "Show example Graydaze training questions"
+            },
+            {
+              "title": "ask",
+              "description": "Ask the Graydaze PM Training Vault a question"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "permissions": [
+    "identity",
+    "messageTeamMembers"
+  ],
+  "validDomains": [
+    "__BOT_HOSTNAME__"
+  ],
+  "webApplicationInfo": {
+    "id": "__BOT_APP_ID__",
+    "resource": "api://botid-__BOT_APP_ID__"
+  }
+}
