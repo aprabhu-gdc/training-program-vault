@@ -48,11 +48,13 @@ class BackendSettings:
     openai_api_key: str
     openai_base_url: str
     openai_chat_model: str
+    openai_vision_model: str
     openai_embedding_model: str
     azure_openai_endpoint: str
     azure_openai_api_key: str
     azure_openai_api_version: str
     azure_openai_chat_deployment: str
+    azure_openai_vision_deployment: str
     azure_openai_embedding_deployment: str
     egnyte_domain: str
     egnyte_api_token: str
@@ -105,7 +107,8 @@ class BackendSettings:
             max_source_chars=int(_read_env("AUTO_INGEST_MAX_SOURCE_CHARS", default="18000")),
             openai_api_key=_read_env("OPENAI_API_KEY"),
             openai_base_url=_read_env("OPENAI_BASE_URL"),
-            openai_chat_model=_read_env("OPENAI_CHAT_MODEL", default="gpt-4o"),
+            openai_chat_model=_read_env("OPENAI_CHAT_MODEL"),
+            openai_vision_model=_read_env("OPENAI_VISION_MODEL"),
             openai_embedding_model=_read_env(
                 "OPENAI_EMBEDDING_MODEL",
                 default="text-embedding-3-large",
@@ -117,6 +120,7 @@ class BackendSettings:
                 default="2024-02-01",
             ),
             azure_openai_chat_deployment=_read_env("AZURE_OPENAI_CHAT_DEPLOYMENT"),
+            azure_openai_vision_deployment=_read_env("AZURE_OPENAI_VISION_DEPLOYMENT"),
             azure_openai_embedding_deployment=_read_env("AZURE_OPENAI_EMBEDDING_DEPLOYMENT"),
             egnyte_domain=_read_env("EGNYTE_DOMAIN"),
             egnyte_api_token=_read_env("EGNYTE_API_TOKEN"),
@@ -180,6 +184,11 @@ class BackendSettings:
         if not self.openai_api_key:
             raise ValueError(
                 "OPENAI_API_KEY is required unless Azure OpenAI settings are configured."
+            )
+
+        if not self.openai_chat_model:
+            raise ValueError(
+                "OPENAI_CHAT_MODEL is required unless Azure OpenAI settings are configured."
             )
 
     def validate_egnyte(self) -> None:

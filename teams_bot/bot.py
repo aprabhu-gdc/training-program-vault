@@ -3,22 +3,34 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import logging
+import mimetypes
 import re
+import tempfile
 import uuid
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
+import aiohttp
 from botbuilder.core import ConversationState, TurnContext, UserState
 from botbuilder.core.teams import TeamsActivityHandler
-from botbuilder.schema import Activity, ActivityTypes, InvokeResponse
+from botbuilder.schema import Activity, ActivityTypes, Attachment, InvokeResponse
 
 from rag_backend.auto_ingest import SyncReport
+from scripts.extract_text import SUPPORTED_EXTENSIONS, extract_text
 from teams_bot.cards import build_feedback_card
 from teams_bot.config import Settings
 from teams_bot.services.feedback import FeedbackEvent, FeedbackLogger
-from teams_bot.services.wiki_query import WikiIntegrationError, WikiQueryRequest, WikiQueryService
+from teams_bot.services.wiki_query import (
+    WikiIntegrationError,
+    WikiQueryAttachment,
+    WikiQueryRequest,
+    WikiQueryService,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -85,14 +97,41 @@ class GraydazeTrainingBot(TeamsActivityHandler):
             await self._send_welcome_if_needed(turn_context)
 
             query_text = self._extract_message_text(turn_context)
+            if self._is_sync_command(query_text):
+                await self._handle_sync_command(turn_context)
+                return
+
+            incoming_attachments = [
+                attachment
+                for attachment in (turn_context.activity.attachments or [])
+                if self._is_user_file_attachment(attachment)
+            ]
+            query_attachments, skipped_attachments = await self._extract_query_attachments(
+                incoming_attachments
+            )
+
+            if incoming_attachments and not query_attachments:
+                await turn_context.send_activity(
+                    "I couldn’t read the attached file. I currently support images plus .pdf, .docx, .pptx, .xlsx, .xlsm, .txt, .md, .csv, and .json attachments."
+                )
+                return
+
+            if skipped_attachments:
+                await turn_context.send_activity(
+                    "I used the supported attachment inputs and skipped: "
+                    + ", ".join(f"`{name}`" for name in skipped_attachments)
+                    + "."
+                )
+
+            if not query_text and query_attachments:
+                query_text = (
+                    "Please analyze the attached file or image using the Graydaze PM Training Vault as the reference."
+                )
+
             if not query_text:
                 await turn_context.send_activity(
                     "Send me a training question and I’ll search the Graydaze PM Training Vault for you."
                 )
-                return
-
-            if self._is_sync_command(query_text):
-                await self._handle_sync_command(turn_context)
                 return
 
             request_id = uuid.uuid4().hex[:12]
@@ -110,6 +149,7 @@ class GraydazeTrainingBot(TeamsActivityHandler):
                 tenant_id=self._extract_tenant_id(turn_context.activity.channel_data),
                 locale=turn_context.activity.locale,
                 channel_data=turn_context.activity.channel_data,
+                attachments=query_attachments,
             )
 
             LOGGER.info(
@@ -223,6 +263,150 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         if report.skipped_files:
             message += f" {len(report.skipped_files)} files were unchanged and skipped."
         await turn_context.send_activity(message)
+
+    async def _extract_query_attachments(
+        self,
+        attachments: list[Attachment],
+    ) -> tuple[tuple[WikiQueryAttachment, ...], tuple[str, ...]]:
+        """Download and normalize supported Teams attachments for the query backend."""
+
+        processed: list[WikiQueryAttachment] = []
+        skipped: list[str] = []
+        for attachment in attachments:
+            query_attachment = await self._build_query_attachment(attachment)
+            if query_attachment is not None:
+                processed.append(query_attachment)
+            else:
+                skipped.append(self._attachment_name(attachment))
+        return tuple(processed), tuple(skipped)
+
+    async def _build_query_attachment(
+        self,
+        attachment: Attachment,
+    ) -> WikiQueryAttachment | None:
+        """Convert a Teams attachment into text or image context for the backend."""
+
+        download_url = self._attachment_download_url(attachment)
+        if not download_url:
+            LOGGER.info(
+                "Skipping attachment without download URL name=%s content_type=%s",
+                self._attachment_name(attachment),
+                self._attachment_content_type(attachment),
+            )
+            return None
+
+        name = self._attachment_name(attachment)
+        content_type = self._attachment_content_type(attachment)
+        try:
+            payload = await self._download_attachment(download_url)
+        except Exception:
+            LOGGER.warning("Failed to download attachment name=%s url=%s", name, download_url, exc_info=True)
+            return None
+
+        if self._is_image_attachment(name=name, content_type=content_type):
+            image_content_type = content_type or mimetypes.guess_type(name)[0] or "image/png"
+            return WikiQueryAttachment(
+                name=name,
+                content_type=image_content_type,
+                image_data_url=self._to_data_url(payload, image_content_type),
+            )
+
+        extracted_text = await self._extract_attachment_text(
+            name=name,
+            content_type=content_type,
+            payload=payload,
+        )
+        if not extracted_text:
+            return None
+
+        return WikiQueryAttachment(
+            name=name,
+            content_type=content_type or "application/octet-stream",
+            text_content=extracted_text,
+        )
+
+    async def _download_attachment(self, download_url: str) -> bytes:
+        timeout = aiohttp.ClientTimeout(total=self._settings.wiki_query_timeout_seconds)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(download_url) as response:
+                response.raise_for_status()
+                return await response.read()
+
+    async def _extract_attachment_text(
+        self,
+        *,
+        name: str,
+        content_type: str,
+        payload: bytes,
+    ) -> str:
+        suffix = Path(name).suffix.lower()
+        if suffix in SUPPORTED_EXTENSIONS:
+            with tempfile.TemporaryDirectory(prefix="graydaze-attachment-") as temp_dir:
+                file_path = Path(temp_dir) / name
+                file_path.write_bytes(payload)
+                text = await asyncio.to_thread(extract_text, file_path)
+        elif content_type.startswith("text/") or suffix in {".txt", ".md", ".csv", ".json"}:
+            text = payload.decode("utf-8", errors="replace")
+        else:
+            return ""
+
+        return text.strip()[:12000]
+
+    @staticmethod
+    def _attachment_download_url(attachment: Attachment) -> str:
+        if isinstance(attachment.content, dict):
+            download_url = attachment.content.get("downloadUrl") or attachment.content.get("url")
+            if download_url:
+                return str(download_url)
+        if attachment.content_url:
+            return str(attachment.content_url)
+        return ""
+
+    @staticmethod
+    def _attachment_name(attachment: Attachment) -> str:
+        if attachment.name:
+            return str(attachment.name)
+        if isinstance(attachment.content, dict):
+            content_name = attachment.content.get("name")
+            if content_name:
+                return str(content_name)
+            file_type = str(attachment.content.get("fileType") or "").strip().lower()
+            if file_type:
+                return f"attachment.{file_type}"
+        download_url = str(attachment.content_url or "")
+        if download_url:
+            path = urlsplit(download_url).path
+            candidate = Path(unquote(path)).name
+            if candidate:
+                return candidate
+        return "attachment.bin"
+
+    @staticmethod
+    def _attachment_content_type(attachment: Attachment) -> str:
+        content_type = str(attachment.content_type or "").strip().lower()
+        if content_type and content_type != "application/vnd.microsoft.teams.file.download.info":
+            return content_type
+        guessed, _encoding = mimetypes.guess_type(GraydazeTrainingBot._attachment_name(attachment))
+        return guessed or ""
+
+    @staticmethod
+    def _is_image_attachment(*, name: str, content_type: str) -> bool:
+        if content_type.startswith("image/"):
+            return True
+        guessed, _encoding = mimetypes.guess_type(name)
+        return bool(guessed and guessed.startswith("image/"))
+
+    @staticmethod
+    def _to_data_url(payload: bytes, content_type: str) -> str:
+        encoded = base64.b64encode(payload).decode("ascii")
+        return f"data:{content_type};base64,{encoded}"
+
+    @staticmethod
+    def _is_user_file_attachment(attachment: Attachment) -> bool:
+        content_type = str(attachment.content_type or "").lower()
+        if content_type == "application/vnd.microsoft.card.adaptive":
+            return False
+        return bool(attachment.content_url or isinstance(attachment.content, dict))
 
     def _is_feedback_submission(self, activity: Activity) -> bool:
         """Return True when the inbound activity is one of our feedback button clicks."""

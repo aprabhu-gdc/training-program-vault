@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 import lancedb
 
@@ -12,6 +12,7 @@ from rag_backend.config import BackendSettings
 from rag_backend.indexer import VaultIndexer
 from rag_backend.llm import complete_text_async, embed_texts_async
 from rag_backend.markdown import clean_obsidian_links, parse_sources_metadata, split_frontmatter
+from teams_bot.services.wiki_query import WikiQueryAttachment
 
 
 LOGGER = logging.getLogger(__name__)
@@ -62,6 +63,7 @@ def _build_system_prompt(index_summary: str) -> str:
         f"{index_summary}\n\n"
         "Rules:\n"
         "- Every factual sentence grounded in retrieved context must end with a citation in the exact format [Source: Title].\n"
+        "- Uploaded attachment content is user-supplied context, not a wiki source. Do not fabricate [Source: ...] citations for the attachment itself.\n"
         "- If a sentence is supported by multiple chunks from the same title, cite it once with that title.\n"
         "- If retrieved context conflicts, state the conflict explicitly and cite each claim separately.\n"
         "- Convert Obsidian wikilinks into plain bold labels for Teams, for example [[wiki/concepts/etc|Estimate to Complete]] becomes **Estimate to Complete**.\n"
@@ -91,6 +93,90 @@ def _build_user_prompt(query: str, chunks: list[RetrievedChunk]) -> str:
     return f"User question:\n{query.strip()}\n\nRetrieved wiki context:\n{joined_context}"
 
 
+def _build_attachment_context(attachments: list[WikiQueryAttachment]) -> str:
+    sections: list[str] = []
+    for index, attachment in enumerate(attachments, start=1):
+        details = [
+            f"Attachment {index}",
+            f"Name: {attachment.name}",
+            f"Content-Type: {attachment.content_type}",
+        ]
+        if attachment.text_content:
+            details.append("Extracted Text:")
+            details.append(attachment.text_content.strip())
+        elif attachment.image_data_url:
+            details.append("Image supplied for visual analysis.")
+        sections.append("\n".join(details))
+    return "\n\n".join(sections)
+
+
+def _normalize_attachments(raw_attachments: list[Any]) -> list[WikiQueryAttachment]:
+    attachments: list[WikiQueryAttachment] = []
+    for item in raw_attachments:
+        if isinstance(item, WikiQueryAttachment):
+            attachments.append(item)
+            continue
+        if isinstance(item, Mapping):
+            attachments.append(
+                WikiQueryAttachment(
+                    name=str(item.get("name") or "attachment"),
+                    content_type=str(item.get("content_type") or "application/octet-stream"),
+                    text_content=(
+                        str(item.get("text_content"))
+                        if item.get("text_content") is not None
+                        else None
+                    ),
+                    image_data_url=(
+                        str(item.get("image_data_url"))
+                        if item.get("image_data_url") is not None
+                        else None
+                    ),
+                )
+            )
+    return attachments
+
+
+def _build_retrieval_query(query: str, attachments: list[WikiQueryAttachment]) -> str:
+    if not attachments:
+        return query
+
+    parts = [query.strip()]
+    for attachment in attachments:
+        name = attachment.name.strip()
+        if name:
+            parts.append(f"Attachment name: {name}")
+        if attachment.text_content:
+            parts.append("Attachment excerpt: " + attachment.text_content[:1500])
+    combined = "\n".join(part for part in parts if part)
+    return combined[:4000] or query
+
+
+def _build_user_content(
+    *,
+    query: str,
+    chunks: list[RetrievedChunk],
+    attachments: list[WikiQueryAttachment],
+) -> str | list[dict[str, Any]]:
+    text_prompt = _build_user_prompt(query=query, chunks=chunks)
+    if attachments:
+        attachment_context = _build_attachment_context(attachments)
+        text_prompt = text_prompt + "\n\nAttachment context:\n" + attachment_context
+
+    image_inputs = [attachment for attachment in attachments if attachment.image_data_url]
+    if not image_inputs:
+        return text_prompt
+
+    content: list[dict[str, Any]] = [{"type": "text", "text": text_prompt}]
+    for attachment in image_inputs:
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": attachment.image_data_url},
+            }
+        )
+    return content
+
+
 def _open_table(settings: BackendSettings):
     settings.ensure_data_dirs()
     db = lancedb.connect(str(settings.vector_db_path))
@@ -116,7 +202,11 @@ async def query_vault(query: str, request_id: str, **kwargs) -> str:
     if table is None or table.count_rows() == 0:
         return "I couldn’t find anything relevant in the current wiki for that question."
 
-    query_embedding = (await embed_texts_async([query], settings))[0]
+    raw_attachments = kwargs.get("attachments") or []
+    attachments = _normalize_attachments(list(raw_attachments))
+
+    retrieval_query = _build_retrieval_query(query, attachments)
+    query_embedding = (await embed_texts_async([retrieval_query], settings))[0]
     results = table.search(query_embedding).limit(settings.rag_top_k).to_list()
 
     chunks = [
@@ -141,8 +231,9 @@ async def query_vault(query: str, request_id: str, **kwargs) -> str:
     index_summary = _load_index_summary(settings)
     answer = await complete_text_async(
         system_prompt=_build_system_prompt(index_summary=index_summary),
-        user_prompt=_build_user_prompt(query=query, chunks=chunks),
+        user_prompt=_build_user_content(query=query, chunks=chunks, attachments=attachments),
         settings=settings,
         temperature=0.1,
+        requires_vision=any(attachment.image_data_url for attachment in attachments),
     )
     return clean_obsidian_links(answer)

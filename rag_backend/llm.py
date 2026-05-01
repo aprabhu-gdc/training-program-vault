@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from itertools import islice
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from openai import AsyncAzureOpenAI, AsyncOpenAI, AzureOpenAI, OpenAI
 
@@ -20,9 +20,13 @@ def _batched(values: Sequence[str], size: int = 64) -> Iterable[list[str]]:
         yield batch
 
 
-def _chat_model(settings: BackendSettings) -> str:
+def _chat_model(settings: BackendSettings, *, requires_vision: bool = False) -> str:
     if settings.uses_azure_openai:
+        if requires_vision and settings.azure_openai_vision_deployment:
+            return settings.azure_openai_vision_deployment
         return settings.azure_openai_chat_deployment
+    if requires_vision and settings.openai_vision_model:
+        return settings.openai_vision_model
     return settings.openai_chat_model
 
 
@@ -102,17 +106,19 @@ def complete_json_sync(
 async def complete_text_async(
     *,
     system_prompt: str,
-    user_prompt: str,
+    user_prompt: str | list[dict[str, Any]],
     settings: BackendSettings,
     temperature: float = 0.1,
+    requires_vision: bool = False,
 ) -> str:
     client = create_async_client(settings)
+    user_content: Any = user_prompt
     response = await client.chat.completions.create(
-        model=_chat_model(settings),
+        model=_chat_model(settings, requires_vision=requires_vision),
         temperature=temperature,
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": user_content},
         ],
     )
     return (response.choices[0].message.content or "").strip()

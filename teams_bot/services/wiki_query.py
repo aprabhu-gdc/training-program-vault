@@ -13,7 +13,7 @@ import asyncio
 import importlib
 import inspect
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Callable, Mapping
 
 import aiohttp
@@ -24,6 +24,16 @@ LOGGER = logging.getLogger(__name__)
 
 class WikiIntegrationError(RuntimeError):
     """Raised when the Teams bot cannot call the existing wiki query layer."""
+
+
+@dataclass(frozen=True)
+class WikiQueryAttachment:
+    """Preprocessed attachment context passed to the wiki query backend."""
+
+    name: str
+    content_type: str
+    text_content: str | None = None
+    image_data_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -39,6 +49,7 @@ class WikiQueryRequest:
     tenant_id: str | None
     locale: str | None
     channel_data: Any
+    attachments: tuple[WikiQueryAttachment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -157,6 +168,7 @@ class WikiQueryService:
             "tenant_id": request.tenant_id,
             "locale": request.locale,
             "channel_data": request.channel_data,
+            "attachments": request.attachments,
         }
 
         args: list[Any] = []
@@ -262,6 +274,7 @@ class HttpWikiQueryService:
             "channel_id": request.channel_id,
             "tenant_id": request.tenant_id,
             "locale": request.locale,
+            "attachments": [asdict(attachment) for attachment in request.attachments],
         }
 
         timeout = aiohttp.ClientTimeout(total=self._timeout_seconds)
