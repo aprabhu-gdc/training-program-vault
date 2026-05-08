@@ -17,7 +17,7 @@ The bot retrieves only from `wiki/`. The `raw/` folder is used for source captur
 - Local embedded vector index for `wiki/` content using LanceDB
 - Markdown-aware chunking by `##` headings
 - YAML frontmatter parsing and metadata propagation into index rows
-- Provider-agnostic LLM configuration with current runtime support for OpenAI and Azure OpenAI
+- Provider-agnostic LLM configuration with runtime support for OpenAI, Azure OpenAI, Anthropic, and Google
 - Teams bot with typing indicators, welcome message, and feedback buttons
 - Teams manual `/sync` command for Egnyte refresh
 - Egnyte webhook endpoint for background ingest and reindexing
@@ -129,12 +129,20 @@ Routing behavior:
 
 ### Current Runtime Support
 
-The configuration scheme is provider-agnostic, but the current implemented runtime adapters support these providers today:
+The configuration scheme is provider-agnostic, and the current implemented runtime adapters support these chat/vision providers today:
 
 - `openai`
 - `azure-openai`
+- `anthropic`
+- `google`
 
-`anthropic` and `google` can now be represented in configuration without renaming keys later, but they are not implemented in `rag_backend/llm.py` yet.
+The current implemented embedding providers are:
+
+- `openai`
+- `azure-openai`
+- `google`
+
+Anthropic is not implemented for embeddings in the current runtime.
 
 ### Vision Behavior
 

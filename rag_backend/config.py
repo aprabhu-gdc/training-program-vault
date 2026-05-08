@@ -13,8 +13,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LOCAL_DATA_ROOT = Path(os.getenv("LOCALAPPDATA", str(REPO_ROOT))) / "GraydazeTrainingVault"
 
 KNOWN_LLM_PROVIDERS = {"openai", "azure-openai", "anthropic", "google"}
-IMPLEMENTED_CHAT_PROVIDERS = {"openai", "azure-openai"}
-IMPLEMENTED_EMBEDDING_PROVIDERS = {"openai", "azure-openai"}
+IMPLEMENTED_CHAT_PROVIDERS = {"openai", "azure-openai", "anthropic", "google"}
+IMPLEMENTED_EMBEDDING_PROVIDERS = {"openai", "azure-openai", "google"}
 
 
 load_dotenv()
@@ -303,6 +303,24 @@ class BackendSettings:
                 raise ValueError(
                     "Azure OpenAI is selected for an LLM workload but required settings are missing: "
                     + ", ".join(missing)
+                )
+            return
+
+        if provider == "anthropic":
+            if not self.llm_anthropic_api_key:
+                raise ValueError(
+                    "LLM_ANTHROPIC_API_KEY is required when any configured LLM workload uses provider 'anthropic'."
+                )
+            if capability == "embedding":
+                raise ValueError(
+                    "Anthropic is not supported for embeddings in the current runtime. Use a different embedding provider such as google, openai, or azure-openai."
+                )
+            return
+
+        if provider == "google":
+            if not self.llm_google_api_key:
+                raise ValueError(
+                    "LLM_GOOGLE_API_KEY is required when any configured LLM workload uses provider 'google'."
                 )
 
     def validate_egnyte(self) -> None:
