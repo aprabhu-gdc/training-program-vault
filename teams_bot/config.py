@@ -8,8 +8,6 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
-from rag_backend.config import BackendSettings
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -42,9 +40,9 @@ class Settings:
     port: int
     wiki_query_callable: str
     wiki_query_http_url: str
+    ingest_admin_http_url: str
     wiki_query_timeout_seconds: float
     welcome_examples: tuple[str, str]
-    backend: BackendSettings
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -59,6 +57,7 @@ class Settings:
                 default="rag_backend.query:query_vault",
             ),
             wiki_query_http_url=_read_env("WIKI_QUERY_HTTP_URL"),
+            ingest_admin_http_url=_read_env("INGEST_ADMIN_HTTP_URL"),
             wiki_query_timeout_seconds=float(
                 _read_env("WIKI_QUERY_TIMEOUT_SECONDS", default="45")
             ),
@@ -66,7 +65,6 @@ class Settings:
                 "What is an ETC and how often should I update it?",
                 "What should I do before a dump meeting?",
             ),
-            backend=BackendSettings.from_env(),
         )
 
     def validate(self) -> None:
@@ -83,4 +81,9 @@ class Settings:
             LOGGER.warning(
                 "MicrosoftAppId/MicrosoftAppPassword are empty. This is only suitable for local "
                 "Bot Framework Emulator-style testing and will not work for a real Teams deployment."
+            )
+
+        if not self.ingest_admin_http_url:
+            raise ValueError(
+                "INGEST_ADMIN_HTTP_URL is required so Teams /sync requests can be submitted to the remote ingest API."
             )

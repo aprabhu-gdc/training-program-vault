@@ -10,7 +10,6 @@ import mimetypes
 import re
 import tempfile
 import uuid
-from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -20,15 +19,15 @@ from botbuilder.core import ConversationState, TurnContext, UserState
 from botbuilder.core.teams import TeamsActivityHandler
 from botbuilder.schema import Activity, ActivityTypes, Attachment, InvokeResponse
 
-from rag_backend.auto_ingest import SyncReport
-from scripts.extract_text import SUPPORTED_EXTENSIONS, extract_text
+from packages.contracts.identity import CallerIdentity
+from packages.contracts.query import QueryAttachment, QueryRequest
+from packages.shared.documents.extract_text import SUPPORTED_EXTENSIONS, extract_text
 from teams_bot.cards import build_feedback_card
 from teams_bot.config import Settings
 from teams_bot.services.feedback import FeedbackEvent, FeedbackLogger
+from teams_bot.services.ingest_admin_client import HttpIngestAdminClient
 from teams_bot.services.wiki_query import (
     WikiIntegrationError,
-    WikiQueryAttachment,
-    WikiQueryRequest,
     WikiQueryService,
 )
 
@@ -47,7 +46,7 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         conversation_state: ConversationState,
         wiki_query_service: WikiQueryService,
         feedback_logger: FeedbackLogger,
-        sync_runner: Callable[[str, dict[str, Any] | None], Awaitable[SyncReport]],
+        ingest_admin_client: HttpIngestAdminClient,
     ) -> None:
         super().__init__()
         self._settings = settings
@@ -55,7 +54,7 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         self._conversation_state = conversation_state
         self._wiki_query_service = wiki_query_service
         self._feedback_logger = feedback_logger
-        self._sync_runner = sync_runner
+        self._ingest_admin_client = ingest_admin_client
         # Use a simple boolean property rather than a custom object so the state
         # remains JSON-serializable across real storage providers.
         self._welcome_accessor = self._user_state.create_property("HasSeenWelcome")
@@ -135,28 +134,29 @@ class GraydazeTrainingBot(TeamsActivityHandler):
                 return
 
             request_id = uuid.uuid4().hex[:12]
-            request = WikiQueryRequest(
+            request = QueryRequest(
                 request_id=request_id,
                 query=query_text,
-                user_id=turn_context.activity.from_property.id if turn_context.activity.from_property else None,
-                user_name=turn_context.activity.from_property.name if turn_context.activity.from_property else None,
-                conversation_id=(
-                    turn_context.activity.conversation.id
-                    if turn_context.activity.conversation
-                    else None
+                identity=CallerIdentity(
+                    user_id=turn_context.activity.from_property.id if turn_context.activity.from_property else None,
+                    user_name=turn_context.activity.from_property.name if turn_context.activity.from_property else None,
+                    tenant_id=self._extract_tenant_id(turn_context.activity.channel_data),
+                    client_app="teams-bot",
+                    channel_id=turn_context.activity.channel_id,
+                    conversation_id=(
+                        turn_context.activity.conversation.id if turn_context.activity.conversation else None
+                    ),
+                    locale=turn_context.activity.locale,
                 ),
-                channel_id=turn_context.activity.channel_id,
-                tenant_id=self._extract_tenant_id(turn_context.activity.channel_data),
-                locale=turn_context.activity.locale,
-                channel_data=turn_context.activity.channel_data,
                 attachments=query_attachments,
+                client_context={"channel_data": turn_context.activity.channel_data},
             )
 
             LOGGER.info(
                 "Dispatching Teams query request_id=%s user_id=%s conversation_id=%s text=%r",
                 request.request_id,
-                request.user_id,
-                request.conversation_id,
+                request.identity.user_id,
+                request.identity.conversation_id,
                 request.query,
             )
 
@@ -246,31 +246,33 @@ class GraydazeTrainingBot(TeamsActivityHandler):
 
         await turn_context.send_activity("Syncing with Egnyte. I’ll post the result here when it finishes.")
         try:
-            report = await self._sync_runner("teams-manual-sync", None)
+            accepted = await self._ingest_admin_client.request_manual_sync(
+                requested_by_user_id=(
+                    turn_context.activity.from_property.id if turn_context.activity.from_property else None
+                ),
+                requested_by_user_name=(
+                    turn_context.activity.from_property.name if turn_context.activity.from_property else None
+                ),
+            )
         except Exception:
             LOGGER.exception("Manual Teams sync failed")
             await turn_context.send_activity(
-                "Syncing with Egnyte failed before the wiki could be refreshed. Check the app logs for details."
+                "Syncing with Egnyte could not be queued. Check the ingest service and app logs for details."
             )
             return
 
-        message = (
-            "Syncing with Egnyte complete. "
-            f"{len(report.downloaded_files)} files updated, "
-            f"{len(report.updated_wiki_files)} wiki files changed, and "
-            f"{len(report.index_report.indexed_files)} wiki files were re-indexed."
+        await turn_context.send_activity(
+            "Syncing with Egnyte has been queued. "
+            f"Job ID: `{accepted.job_id}`."
         )
-        if report.skipped_files:
-            message += f" {len(report.skipped_files)} files were unchanged and skipped."
-        await turn_context.send_activity(message)
 
     async def _extract_query_attachments(
         self,
         attachments: list[Attachment],
-    ) -> tuple[tuple[WikiQueryAttachment, ...], tuple[str, ...]]:
+    ) -> tuple[tuple[QueryAttachment, ...], tuple[str, ...]]:
         """Download and normalize supported Teams attachments for the query backend."""
 
-        processed: list[WikiQueryAttachment] = []
+        processed: list[QueryAttachment] = []
         skipped: list[str] = []
         for attachment in attachments:
             query_attachment = await self._build_query_attachment(attachment)
@@ -283,7 +285,7 @@ class GraydazeTrainingBot(TeamsActivityHandler):
     async def _build_query_attachment(
         self,
         attachment: Attachment,
-    ) -> WikiQueryAttachment | None:
+    ) -> QueryAttachment | None:
         """Convert a Teams attachment into text or image context for the backend."""
 
         download_url = self._attachment_download_url(attachment)
@@ -305,7 +307,7 @@ class GraydazeTrainingBot(TeamsActivityHandler):
 
         if self._is_image_attachment(name=name, content_type=content_type):
             image_content_type = content_type or mimetypes.guess_type(name)[0] or "image/png"
-            return WikiQueryAttachment(
+            return QueryAttachment(
                 name=name,
                 content_type=image_content_type,
                 image_data_url=self._to_data_url(payload, image_content_type),
@@ -319,7 +321,7 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         if not extracted_text:
             return None
 
-        return WikiQueryAttachment(
+        return QueryAttachment(
             name=name,
             content_type=content_type or "application/octet-stream",
             text_content=extracted_text,

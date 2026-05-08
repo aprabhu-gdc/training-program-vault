@@ -1,5 +1,3 @@
-"""Graydaze training vault RAG and sync backend."""
+"""Graydaze training vault RAG and sync backend compatibility package."""
 
-from .auto_ingest import AutoIngestService, SyncReport
-
-__all__ = ["AutoIngestService", "SyncReport"]
+__all__: list[str] = []

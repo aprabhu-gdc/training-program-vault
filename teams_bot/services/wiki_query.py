@@ -13,10 +13,13 @@ import asyncio
 import importlib
 import inspect
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from typing import Any, Callable, Mapping
 
 import aiohttp
+
+from packages.contracts.identity import CallerIdentity
+from packages.contracts.query import Citation, QueryAttachment, QueryRequest, QueryResponse
 
 
 LOGGER = logging.getLogger(__name__)
@@ -26,38 +29,9 @@ class WikiIntegrationError(RuntimeError):
     """Raised when the Teams bot cannot call the existing wiki query layer."""
 
 
-@dataclass(frozen=True)
-class WikiQueryAttachment:
-    """Preprocessed attachment context passed to the wiki query backend."""
-
-    name: str
-    content_type: str
-    text_content: str | None = None
-    image_data_url: str | None = None
-
-
-@dataclass(frozen=True)
-class WikiQueryRequest:
-    """Structured request context passed into the existing wiki query function."""
-
-    request_id: str
-    query: str
-    user_id: str | None
-    user_name: str | None
-    conversation_id: str | None
-    channel_id: str | None
-    tenant_id: str | None
-    locale: str | None
-    channel_data: Any
-    attachments: tuple[WikiQueryAttachment, ...] = ()
-
-
-@dataclass(frozen=True)
-class WikiQueryResult:
-    """Normalized response returned from the existing wiki query function."""
-
-    answer_text: str
-    raw_result: Any
+WikiQueryAttachment = QueryAttachment
+WikiQueryRequest = QueryRequest
+WikiQueryResult = QueryResponse
 
 
 class WikiQueryService:
@@ -127,7 +101,7 @@ class WikiQueryService:
         if not answer_text:
             raise WikiIntegrationError("Wiki query callable returned an empty answer.")
 
-        return WikiQueryResult(answer_text=answer_text, raw_result=raw_result)
+        return WikiQueryResult(answer_text=answer_text)
 
     async def _invoke(self, *args: Any, **kwargs: Any) -> Any:
         """Call the backend function while supporting both sync and async callables."""
@@ -161,13 +135,13 @@ class WikiQueryService:
             "prompt": request.query,
             "message": request.query,
             "request_id": request.request_id,
-            "user_id": request.user_id,
-            "user_name": request.user_name,
-            "conversation_id": request.conversation_id,
-            "channel_id": request.channel_id,
-            "tenant_id": request.tenant_id,
-            "locale": request.locale,
-            "channel_data": request.channel_data,
+            "user_id": request.identity.user_id,
+            "user_name": request.identity.user_name,
+            "conversation_id": request.identity.conversation_id,
+            "channel_id": request.identity.channel_id,
+            "tenant_id": request.identity.tenant_id,
+            "locale": request.identity.locale,
+            "channel_data": request.client_context.get("channel_data"),
             "attachments": request.attachments,
         }
 
@@ -268,12 +242,12 @@ class HttpWikiQueryService:
         payload = {
             "request_id": request.request_id,
             "query": request.query,
-            "user_id": request.user_id,
-            "user_name": request.user_name,
-            "conversation_id": request.conversation_id,
-            "channel_id": request.channel_id,
-            "tenant_id": request.tenant_id,
-            "locale": request.locale,
+            "user_id": request.identity.user_id,
+            "user_name": request.identity.user_name,
+            "conversation_id": request.identity.conversation_id,
+            "channel_id": request.identity.channel_id,
+            "tenant_id": request.identity.tenant_id,
+            "locale": request.identity.locale,
             "attachments": [asdict(attachment) for attachment in request.attachments],
         }
 
@@ -299,4 +273,26 @@ class HttpWikiQueryService:
         if not answer_text:
             raise WikiIntegrationError("Wiki HTTP endpoint returned an empty answer.")
 
-        return WikiQueryResult(answer_text=answer_text, raw_result=raw_result)
+        if isinstance(raw_result, Mapping):
+            citations = tuple(
+                Citation(
+                    title=str(item.get("title") or "Untitled"),
+                    path=str(item.get("path") or ""),
+                    section=(str(item.get("section")) if item.get("section") is not None else None),
+                    sources=tuple(str(source) for source in list(item.get("sources") or [])),
+                )
+                for item in list(raw_result.get("citations") or [])
+                if isinstance(item, Mapping)
+            )
+            diagnostics = raw_result.get("retrieval_diagnostics")
+            if not isinstance(diagnostics, dict):
+                diagnostics = {}
+            warnings = tuple(str(item) for item in list(raw_result.get("warnings") or []))
+            return WikiQueryResult(
+                answer_text=answer_text,
+                citations=citations,
+                warnings=warnings,
+                retrieval_diagnostics=diagnostics,
+            )
+
+        return WikiQueryResult(answer_text=answer_text)

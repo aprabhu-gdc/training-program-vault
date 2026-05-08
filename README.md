@@ -4,11 +4,16 @@ Graydaze PM Training Vault is a private wiki-backed Teams assistant for Graydaze
 
 ## Repository Purpose
 
-This repository contains three main layers:
+This repository now separates the runtime into thin service boundaries while keeping one-release compatibility shims for the older `rag_backend/` imports.
+
+The main layers are:
 
 - `wiki/`: the maintained knowledge base that the bot queries
-- `rag_backend/`: indexing, retrieval, Egnyte sync, and auto-ingest logic
-- `teams_bot/` and `app.py`: the Microsoft Teams bot and HTTP entrypoint
+- `packages/`: shared contracts, document extraction, retrieval core, and ingest core
+- `apps/`: standalone HTTP apps for the Teams bot wrapper, wiki query API, and ingest API
+- `workers/`: background ingest workers that consume queued jobs
+- `teams_bot/` and `app.py`: the thin Microsoft Teams bot runtime and HTTP entrypoint
+- `rag_backend/`: compatibility wrappers over the extracted core modules
 
 The bot retrieves only from `wiki/`. The `raw/` folder is used for source capture and ingest workflows, not for end-user retrieval.
 
@@ -18,9 +23,12 @@ The bot retrieves only from `wiki/`. The `raw/` folder is used for source captur
 - Markdown-aware chunking by `##` headings
 - YAML frontmatter parsing and metadata propagation into index rows
 - Provider-agnostic LLM configuration with runtime support for OpenAI, Azure OpenAI, Anthropic, and Google
+- Standalone `apps/wiki_query_api` query service
+- Standalone `apps/ingest_api` ingest service with Azure Service Bus job queueing
+- Background `workers/egnyte_ingest_worker` worker for manual sync and webhook-triggered ingest
 - Teams bot with typing indicators, welcome message, and feedback buttons
-- Teams manual `/sync` command for Egnyte refresh
-- Egnyte webhook endpoint for background ingest and reindexing
+- Teams manual `/sync` command that queues an Egnyte refresh job
+- Egnyte webhook endpoint for queued background ingest and reindexing
 - Attachment-aware Teams chat input for supported documents and images
 
 ## Architecture
@@ -34,22 +42,27 @@ The bot retrieves only from `wiki/`. The `raw/` folder is used for source captur
 
 ### Retrieval Layer
 
-- `rag_backend/indexer.py` chunks `wiki/` pages and upserts the vector store
-- `rag_backend/query.py` performs retrieval and answer generation
-- `rag_backend/markdown.py` parses frontmatter and section structure
-- `rag_backend/llm.py` wraps the currently implemented LLM providers behind a generic config contract
+- `packages/wiki_core/retrieval/` contains the extracted indexing and query services
+- `packages/wiki_core/content/` contains markdown parsing and page store helpers
+- `packages/wiki_core/ai/` contains the current model gateway and legacy provider adapter
+- `apps/wiki_query_api/app.py` exposes the extracted query service over HTTP
+- `rag_backend/` remains as a compatibility layer over the extracted modules for one release
 
 ### Sync and Ingest Layer
 
-- `rag_backend/egnyte_client.py` downloads Egnyte files and lists the training folder
-- `rag_backend/auto_ingest.py` synthesizes raw files into maintained wiki pages and reindexes changed pages
-- `scripts/extract_text.py` extracts text from Office and PDF formats used during ingest and Teams attachment preprocessing
+- `packages/wiki_core/ingest/` contains the extracted Egnyte adapter and ingest orchestration service
+- `packages/shared/documents/extract_text.py` extracts text from Office and PDF formats used during ingest and Teams attachment preprocessing
+- `packages/shared/messaging/service_bus.py` wraps Azure Service Bus send/receive helpers
+- `apps/ingest_api/app.py` accepts manual sync and Egnyte webhook requests, then queues jobs
+- `workers/egnyte_ingest_worker/worker.py` performs the actual ingest work from queued jobs
+- `scripts/extract_text.py` remains as a CLI wrapper over the shared extraction library
 
 ### Teams Layer
 
-- `app.py` exposes `/api/messages`, `/api/webhooks/egnyte`, and `/healthz`
+- `app.py` exposes `/api/messages` and `/healthz`
 - `teams_bot/bot.py` handles chat, `/sync`, feedback, and attachment preprocessing
-- `teams_bot/services/wiki_query.py` adapts Teams requests to the backend query callable
+- `teams_bot/services/wiki_query.py` adapts Teams requests to a local callable or remote HTTP query API
+- `teams_bot/services/ingest_admin_client.py` submits `/sync` requests to the remote ingest API
 - `teams_app/manifest.json` contains the Teams app package manifest
 
 ## Key Design Decisions
@@ -156,9 +169,12 @@ See `.env.example` for the full list. The most important settings are:
   - `MicrosoftAppId`
   - `MicrosoftAppPassword`
   - `PORT`
-- Query routing:
   - `WIKI_QUERY_CALLABLE`
+- Query routing:
+  - `QUERY_API_PORT`
   - `WIKI_QUERY_HTTP_URL`
+  - `INGEST_API_PORT`
+  - `INGEST_ADMIN_HTTP_URL`
   - `WIKI_QUERY_TIMEOUT_SECONDS`
 - Retrieval and vector state:
   - `VAULT_ROOT`
@@ -187,6 +203,10 @@ See `.env.example` for the full list. The most important settings are:
   - `EGNYTE_TRAINING_FOLDER_NAME`
   - `EGNYTE_REQUEST_TIMEOUT_SECONDS`
   - `EGNYTE_SYNC_STATE_PATH`
+- Queueing:
+  - `SERVICE_BUS_CONNECTION_STRING`
+  - `SERVICE_BUS_NAMESPACE`
+  - `INGEST_QUEUE_NAME`
 
 ## Setup
 
@@ -198,7 +218,14 @@ python -m pip install -r requirements.txt
 
 ### 2. Configure environment
 
-Create a `.env` file based on `.env.example` and populate the required bot, model, and Egnyte settings.
+Create a `.env` file based on `.env.example` and populate the required bot, model, Egnyte, and queue settings.
+
+For a local split run, set:
+
+- `WIKI_QUERY_HTTP_URL=http://localhost:8000/query`
+- `INGEST_ADMIN_HTTP_URL=http://localhost:8010`
+- `QUERY_API_PORT=8000`
+- `INGEST_API_PORT=8010`
 
 ### 3. Build the initial wiki index
 
@@ -206,7 +233,25 @@ Create a `.env` file based on `.env.example` and populate the required bot, mode
 python -m rag_backend.indexer --mode build
 ```
 
-### 4. Run the bot locally
+### 4. Run the standalone query API
+
+```bash
+python -m apps.wiki_query_api.app
+```
+
+### 5. Run the ingest API
+
+```bash
+python -m apps.ingest_api.app
+```
+
+### 6. Run the ingest worker
+
+```bash
+python -m workers.egnyte_ingest_worker.worker
+```
+
+### 7. Run the bot locally
 
 ```bash
 python app.py
@@ -215,6 +260,17 @@ python app.py
 The app exposes:
 
 - `POST /api/messages`
+- `GET /healthz`
+
+The standalone query API exposes:
+
+- `POST /query`
+- `GET /healthz`
+- `GET /readyz`
+
+The ingest API exposes:
+
+- `POST /admin/sync`
 - `POST /api/webhooks/egnyte`
 - `GET /healthz`
 
@@ -232,13 +288,19 @@ python -m rag_backend.indexer --mode build
 python -m rag_backend.indexer --mode upsert
 ```
 
-### Replay an Egnyte webhook payload
+### Run the queued ingest worker
+
+```bash
+python -m workers.egnyte_ingest_worker.worker
+```
+
+### Replay an Egnyte webhook payload locally with the legacy compatibility shim
 
 ```bash
 python -m rag_backend.auto_ingest --payload path/to/payload.json
 ```
 
-### Manual Egnyte sync
+### Manual Egnyte sync with the legacy compatibility shim
 
 ```bash
 python -m rag_backend.auto_ingest --manual
