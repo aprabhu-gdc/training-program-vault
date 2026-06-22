@@ -116,7 +116,11 @@ class FilePageStore:
 
         page_type = str(page_spec.get("type", "source")).strip()
         title = str(page_spec.get("title", "")).strip() or Path(relative_path).stem.replace("-", " ").title()
-        body = str(page_spec.get("body", "")).strip()
+        raw_body = str(page_spec.get("body", "")).strip()
+        # Strip any frontmatter the LLM included in its body so we don't emit a
+        # second --- block when compose_markdown prepends the canonical one.
+        _embedded_frontmatter, body = split_frontmatter(raw_body)
+        body = body.strip()
         if not body:
             return None
 
