@@ -15,3 +15,23 @@ __pycache__/
 
 # Session transcripts
 session-ses_*.md
+
+# OneDrive / SharePoint sync lock files (UUID-named hidden files)
+.????????-????-????-????-????????????
+
+# Host-specific wiki indexes
+wiki/index-*.md
+
+# Local-only wiki cache (LanceDB is the bot's read path; markdown is human-readable debug)
+wiki/sources/
+wiki/concepts/
+wiki/entities/
+wiki/queries/
+wiki/syntheses/
+wiki/log.md
+wiki/overview.md
+wiki/index.md
+
+# Local source-sync runtime state (defaults under LOCAL_DATA_ROOT; safety net)
+source-sync-state.json
+sync-job-state.json
