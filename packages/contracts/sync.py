@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
-from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -18,13 +17,13 @@ class SourceFileEvent:
 @dataclass(frozen=True)
 class SyncJobAccepted:
     job_id: str
-    status: Literal["accepted"]
+    status: str
 
 
 @dataclass(frozen=True)
 class SyncJobMessage:
     job_id: str
-    job_type: Literal["manual", "webhook"]
+    job_type: str
     payload: dict[str, Any] | None = None
     requested_by_user_id: str | None = None
     requested_by_user_name: str | None = None
