@@ -1,4 +1,4 @@
-"""Aiohttp ingest API that queues Egnyte and manual sync jobs."""
+"""Aiohttp ingest API that queues SharePoint sync jobs (manual + webhook)."""
 
 from __future__ import annotations
 
@@ -9,8 +9,11 @@ import uuid
 
 from aiohttp import web
 
-from packages.contracts.sync import SyncJobAccepted, SyncJobMessage
+from packages.contracts.sync import SourceFileEvent, SyncJobAccepted, SyncJobMessage
+from packages.shared.documents.extract_text import SUPPORTED_EXTENSIONS
 from packages.shared.messaging.service_bus import send_json_message
+from packages.wiki_core.ingest.sharepoint_adapter import SharePointSourceSyncAdapter
+from packages.wiki_core.settings import CoreSettings
 
 from .config import IngestQueueSettings
 
@@ -40,9 +43,27 @@ def _queue_job(settings: IngestQueueSettings, job: SyncJobMessage) -> SyncJobAcc
     return SyncJobAccepted(job_id=job.job_id, status="accepted")
 
 
+def _event_in_scope(adapter: SharePointSourceSyncAdapter, event: SourceFileEvent) -> bool:
+    if not adapter.is_in_scope(event):
+        return False
+    suffix = ""
+    if "." in event.path:
+        suffix = "." + event.path.rsplit(".", maxsplit=1)[1].lower()
+    return suffix in SUPPORTED_EXTENSIONS
+
+
 def create_app() -> web.Application:
     settings = IngestQueueSettings.from_env()
     settings.validate_queue()
+
+    core_settings = CoreSettings.from_env()
+    adapter: SharePointSourceSyncAdapter | None = None
+
+    def _get_adapter() -> SharePointSourceSyncAdapter:
+        nonlocal adapter
+        if adapter is None:
+            adapter = SharePointSourceSyncAdapter(core_settings)
+        return adapter
 
     async def healthcheck(_: web.Request) -> web.Response:
         return web.json_response({"status": "ok"})
@@ -70,32 +91,46 @@ def create_app() -> web.Application:
         )
         return web.json_response({"job_id": accepted.job_id, "status": accepted.status}, status=202)
 
-    async def egnyte_webhook(request: web.Request) -> web.Response:
-        if request.content_type != "application/json":
-            return web.json_response({"error": "Only application/json payloads are supported."}, status=415)
+    async def sharepoint_webhook(request: web.Request) -> web.Response:
+        # Microsoft Graph subscription validation handshake. Graph POSTs with a
+        # validationToken query string and expects a plaintext echo within 10s.
+        validation_token = request.query.get("validationToken")
+        if validation_token is not None:
+            return web.Response(text=validation_token, content_type="text/plain", status=200)
+
         try:
             payload = await request.json()
         except (json.JSONDecodeError, ValueError):
-            LOGGER.warning("Rejected malformed JSON request on /api/webhooks/egnyte")
             return web.json_response({"error": "Malformed JSON payload."}, status=400)
-        if not isinstance(payload, dict):
-            return web.json_response({"error": "Webhook payload must be a JSON object."}, status=400)
 
-        accepted = _queue_job(
-            settings,
-            SyncJobMessage(
-                job_id=uuid.uuid4().hex,
-                job_type="webhook",
-                payload=payload,
-                source="egnyte-webhook",
-            ),
-        )
-        return web.json_response({"job_id": accepted.job_id, "status": accepted.status}, status=202)
+        events = _get_adapter().parse_webhook_payload(payload)
+        queued = 0
+        for event in events:
+            if not _event_in_scope(_get_adapter(), event):
+                continue
+            _queue_job(
+                settings,
+                SyncJobMessage(
+                    job_id=uuid.uuid4().hex,
+                    job_type="webhook",
+                    payload={
+                        "path": event.path,
+                        "modified_at": event.modified_at,
+                        "entry_id": event.entry_id,
+                    },
+                    source="sharepoint-webhook",
+                ),
+            )
+            queued += 1
+
+        LOGGER.info("SharePoint webhook accepted notifications=%s queued=%s", len(events), queued)
+        # Graph requires a 2xx within 10 seconds; the actual ingest happens in the worker.
+        return web.Response(status=202)
 
     app = web.Application()
     app.router.add_get("/healthz", healthcheck)
     app.router.add_post("/admin/sync", manual_sync)
-    app.router.add_post("/api/webhooks/egnyte", egnyte_webhook)
+    app.router.add_post("/api/webhooks/sharepoint", sharepoint_webhook)
     app["settings"] = settings
     return app
 

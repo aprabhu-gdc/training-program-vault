@@ -242,9 +242,9 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         await turn_context.send_activity("Thanks for the feedback.")
 
     async def _handle_sync_command(self, turn_context: TurnContext) -> None:
-        """Trigger a manual Egnyte sync instead of querying the RAG pipeline."""
+        """Trigger a manual SharePoint sync instead of querying the RAG pipeline."""
 
-        await turn_context.send_activity("Syncing with Egnyte. I’ll post the result here when it finishes.")
+        await turn_context.send_activity("Refreshing the training vault from SharePoint. I’ll post the result here when it finishes.")
         try:
             accepted = await self._ingest_admin_client.request_manual_sync(
                 requested_by_user_id=(
@@ -257,12 +257,12 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         except Exception:
             LOGGER.exception("Manual Teams sync failed")
             await turn_context.send_activity(
-                "Syncing with Egnyte could not be queued. Check the ingest service and app logs for details."
+                "The SharePoint refresh could not be queued. Check the ingest service and app logs for details."
             )
             return
 
         await turn_context.send_activity(
-            "Syncing with Egnyte has been queued. "
+            "The SharePoint refresh has been queued. "
             f"Job ID: `{accepted.job_id}`."
         )
 

@@ -12,9 +12,9 @@ from dotenv import load_dotenv
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LOCAL_DATA_ROOT = Path(os.getenv("LOCALAPPDATA", str(REPO_ROOT))) / "GraydazeTrainingVault"
 
-KNOWN_LLM_PROVIDERS = {"openai", "azure-openai", "anthropic", "google"}
-IMPLEMENTED_CHAT_PROVIDERS = {"openai", "azure-openai", "anthropic", "google"}
-IMPLEMENTED_EMBEDDING_PROVIDERS = {"openai", "azure-openai", "google"}
+KNOWN_LLM_PROVIDERS = {"openai", "azure-openai"}
+IMPLEMENTED_CHAT_PROVIDERS = {"openai", "azure-openai"}
+IMPLEMENTED_EMBEDDING_PROVIDERS = {"openai", "azure-openai"}
 
 
 load_dotenv()
@@ -44,9 +44,6 @@ def _normalize_provider(value: str) -> str:
         "openai": "openai",
         "openai-compatible": "openai",
         "openaicompatible": "openai",
-        "anthropic": "anthropic",
-        "google": "google",
-        "gemini": "google",
     }
     return aliases.get(normalized, normalized)
 
@@ -67,7 +64,8 @@ class CoreSettings:
     vector_db_path: Path
     vector_table_name: str
     vector_manifest_path: Path
-    egnyte_state_path: Path
+    source_sync_state_path: Path
+    sync_job_state_path: Path
     rag_top_k: int
     rag_index_summary_chars: int
     max_source_chars: int
@@ -83,15 +81,20 @@ class CoreSettings:
     llm_azure_openai_endpoint: str
     llm_azure_openai_api_key: str
     llm_azure_openai_api_version: str
-    llm_anthropic_api_key: str
-    llm_anthropic_base_url: str
-    llm_google_api_key: str
-    llm_google_base_url: str
-    egnyte_domain: str
-    egnyte_api_token: str
-    egnyte_sync_root: str
-    egnyte_training_folder_name: str
-    egnyte_request_timeout_seconds: float
+    sharepoint_tenant_id: str
+    sharepoint_client_id: str
+    sharepoint_client_secret: str
+    sharepoint_site_id: str
+    sharepoint_site_hostname: str
+    sharepoint_site_path: str
+    sharepoint_list_id: str
+    sharepoint_drive_id: str
+    sharepoint_drive_name: str
+    sharepoint_raw_root_path: str
+    sharepoint_wiki_root_path: str
+    sharepoint_request_timeout_seconds: float
+    sharepoint_webhook_notification_url: str
+    sharepoint_webhook_client_state: str
 
     @classmethod
     def from_env(cls) -> "CoreSettings":
@@ -108,8 +111,12 @@ class CoreSettings:
             _read_env("VECTOR_MANIFEST_PATH", default=str(local_data_root / "index-manifest.json")),
             base=local_data_root,
         )
-        egnyte_state_path = _resolve_path(
-            _read_env("EGNYTE_SYNC_STATE_PATH", default=str(local_data_root / "egnyte-sync-state.json")),
+        source_sync_state_path = _resolve_path(
+            _read_env("SOURCE_SYNC_STATE_PATH", default=str(local_data_root / "source-sync-state.json")),
+            base=local_data_root,
+        )
+        sync_job_state_path = _resolve_path(
+            _read_env("SYNC_JOB_STATE_PATH", default=str(local_data_root / "sync-job-state.json")),
             base=local_data_root,
         )
 
@@ -120,7 +127,8 @@ class CoreSettings:
             vector_db_path=vector_db_path,
             vector_table_name=_read_env("VECTOR_TABLE_NAME", default="training-vault-wiki"),
             vector_manifest_path=vector_manifest_path,
-            egnyte_state_path=egnyte_state_path,
+            source_sync_state_path=source_sync_state_path,
+            sync_job_state_path=sync_job_state_path,
             rag_top_k=int(_read_env("RAG_TOP_K", default="6")),
             rag_index_summary_chars=int(_read_env("RAG_INDEX_SUMMARY_CHARS", default="5000")),
             max_source_chars=int(_read_env("AUTO_INGEST_MAX_SOURCE_CHARS", default="18000")),
@@ -152,15 +160,22 @@ class CoreSettings:
                 "AZURE_OPENAI_API_VERSION",
                 default="2024-02-01",
             ),
-            llm_anthropic_api_key=_read_env("LLM_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
-            llm_anthropic_base_url=_read_env("LLM_ANTHROPIC_BASE_URL"),
-            llm_google_api_key=_read_env("LLM_GOOGLE_API_KEY", "GOOGLE_API_KEY"),
-            llm_google_base_url=_read_env("LLM_GOOGLE_BASE_URL"),
-            egnyte_domain=_read_env("EGNYTE_DOMAIN"),
-            egnyte_api_token=_read_env("EGNYTE_API_TOKEN"),
-            egnyte_sync_root=_read_env("EGNYTE_SYNC_ROOT"),
-            egnyte_training_folder_name=_read_env("EGNYTE_TRAINING_FOLDER_NAME", default="Training Program CRD"),
-            egnyte_request_timeout_seconds=float(_read_env("EGNYTE_REQUEST_TIMEOUT_SECONDS", default="60")),
+            sharepoint_tenant_id=_read_env("SHAREPOINT_TENANT_ID", "AZURE_TENANT_ID"),
+            sharepoint_client_id=_read_env("SHAREPOINT_CLIENT_ID", "AZURE_CLIENT_ID"),
+            sharepoint_client_secret=_read_env("SHAREPOINT_CLIENT_SECRET", "AZURE_CLIENT_SECRET"),
+            sharepoint_site_id=_read_env("SHAREPOINT_SITE_ID"),
+            sharepoint_site_hostname=_read_env("SHAREPOINT_SITE_HOSTNAME", "SHAREPOINT_HOSTNAME"),
+            sharepoint_site_path=_read_env("SHAREPOINT_SITE_PATH"),
+            sharepoint_list_id=_read_env("SHAREPOINT_LIST_ID"),
+            sharepoint_drive_id=_read_env("SHAREPOINT_DRIVE_ID"),
+            sharepoint_drive_name=_read_env("SHAREPOINT_DRIVE_NAME", "SHAREPOINT_LIBRARY_NAME"),
+            sharepoint_raw_root_path=_read_env("SHAREPOINT_RAW_ROOT_PATH", default="raw/sources"),
+            sharepoint_wiki_root_path=_read_env("SHAREPOINT_WIKI_ROOT_PATH", default="wiki"),
+            sharepoint_request_timeout_seconds=float(
+                _read_env("SHAREPOINT_REQUEST_TIMEOUT_SECONDS", default="60")
+            ),
+            sharepoint_webhook_notification_url=_read_env("SHAREPOINT_WEBHOOK_NOTIFICATION_URL"),
+            sharepoint_webhook_client_state=_read_env("SHAREPOINT_WEBHOOK_CLIENT_STATE"),
         )
 
     @property
@@ -204,13 +219,25 @@ class CoreSettings:
         return self.wiki_root / "log.md"
 
     @property
-    def training_folder_marker(self) -> str:
-        return f"/{self.egnyte_training_folder_name.strip('/')}/"
+    def normalized_sharepoint_site_path(self) -> str:
+        path = self.sharepoint_site_path.strip()
+        if not path:
+            return ""
+        return "/" + path.strip("/")
+
+    @property
+    def normalized_sharepoint_raw_root_path(self) -> str:
+        return self.sharepoint_raw_root_path.strip("/")
+
+    @property
+    def normalized_sharepoint_wiki_root_path(self) -> str:
+        return self.sharepoint_wiki_root_path.strip("/")
 
     def ensure_data_dirs(self) -> None:
         self.vector_db_path.mkdir(parents=True, exist_ok=True)
         self.vector_manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        self.egnyte_state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.source_sync_state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.sync_job_state_path.parent.mkdir(parents=True, exist_ok=True)
 
     def validate_llm(self) -> None:
         if not self.chat_provider:
@@ -263,27 +290,38 @@ class CoreSettings:
                 )
             return
 
-        if provider == "anthropic":
-            if not self.llm_anthropic_api_key:
-                raise ValueError("LLM_ANTHROPIC_API_KEY is required when any configured LLM workload uses provider 'anthropic'.")
-            if capability == "embedding":
-                raise ValueError(
-                    "Anthropic is not supported for embeddings in the current runtime. Use a different embedding provider such as google, openai, or azure-openai."
-                )
-            return
-
-        if provider == "google" and not self.llm_google_api_key:
-            raise ValueError("LLM_GOOGLE_API_KEY is required when any configured LLM workload uses provider 'google'.")
-
-    def validate_egnyte(self) -> None:
+    def validate_source_sync(self) -> None:
         missing = [
             name
             for name, value in (
-                ("EGNYTE_DOMAIN", self.egnyte_domain),
-                ("EGNYTE_API_TOKEN", self.egnyte_api_token),
-                ("EGNYTE_SYNC_ROOT", self.egnyte_sync_root),
+                ("SHAREPOINT_RAW_ROOT_PATH", self.normalized_sharepoint_raw_root_path),
+                ("SHAREPOINT_WIKI_ROOT_PATH", self.normalized_sharepoint_wiki_root_path),
             )
             if not value
         ]
         if missing:
-            raise ValueError("Egnyte sync requires the following settings: " + ", ".join(missing))
+            raise ValueError("SharePoint sync requires the following settings: " + ", ".join(missing))
+
+        if not self.sharepoint_site_id and (not self.sharepoint_site_hostname or not self.normalized_sharepoint_site_path):
+            raise ValueError(
+                "Set SHAREPOINT_SITE_ID or both SHAREPOINT_SITE_HOSTNAME and SHAREPOINT_SITE_PATH for SharePoint sync."
+            )
+
+        if not self.sharepoint_list_id and not self.sharepoint_drive_id and not self.sharepoint_drive_name:
+            raise ValueError(
+                "Set one of SHAREPOINT_LIST_ID, SHAREPOINT_DRIVE_ID, or SHAREPOINT_DRIVE_NAME for SharePoint sync."
+            )
+
+        auth_missing = [
+            name
+            for name, value in (
+                ("SHAREPOINT_TENANT_ID", self.sharepoint_tenant_id),
+                ("SHAREPOINT_CLIENT_ID", self.sharepoint_client_id),
+                ("SHAREPOINT_CLIENT_SECRET", self.sharepoint_client_secret),
+            )
+            if not value
+        ]
+        if auth_missing:
+            raise ValueError(
+                "SharePoint app-only auth requires the following settings: " + ", ".join(auth_missing)
+            )

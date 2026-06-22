@@ -1,4 +1,4 @@
-"""Egnyte-to-wiki ingest orchestration following the vault schema."""
+"""SharePoint-to-wiki ingest orchestration following the vault schema."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from packages.shared.documents.extract_text import SUPPORTED_EXTENSIONS, extract
 from packages.wiki_core.ai.legacy_provider_gateway import LegacyProviderGateway
 from packages.wiki_core.content.file_page_store import FilePageStore
 from packages.wiki_core.content.markdown import slugify
-from packages.wiki_core.ingest.egnyte_adapter import EgnyteSourceSyncAdapter
+from packages.wiki_core.ingest.sharepoint_adapter import SharePointSourceSyncAdapter
 from packages.wiki_core.retrieval.index_service import IndexingReport, VaultIndexer
 from packages.wiki_core.settings import CoreSettings
 
@@ -40,10 +40,10 @@ class AutoIngestService:
         self._settings = settings or CoreSettings.from_env()
         self._settings.ensure_data_dirs()
         self._settings.validate_llm()
-        self._settings.validate_egnyte()
+        self._settings.validate_source_sync()
         self._page_store = FilePageStore(self._settings)
         self._model_gateway = LegacyProviderGateway(self._settings)
-        self._source_sync = EgnyteSourceSyncAdapter(self._settings)
+        self._source_sync = SharePointSourceSyncAdapter(self._settings)
         self._indexer = VaultIndexer(self._settings)
 
     def sync_from_webhook(self, payload: dict[str, Any]) -> SyncReport:
@@ -55,11 +55,8 @@ class AutoIngestService:
         return self.sync_events(events)
 
     def sync_all_training_files(self) -> SyncReport:
-        folder_path = "/".join(
-            part.strip("/")
-            for part in (self._settings.egnyte_sync_root, self._settings.egnyte_training_folder_name)
-            if part
-        )
+        self._refresh_local_wiki_from_sharepoint()
+        folder_path = self._settings.normalized_sharepoint_raw_root_path
         events = [
             event
             for event in self._source_sync.list_files_recursive(folder_path)
@@ -95,6 +92,7 @@ class AutoIngestService:
 
         self._save_state(state)
         changed_paths = [self._settings.repo_root / path for path in sorted(set(updated_wiki_files))]
+        self._publish_changed_wiki_files(changed_relative_paths=sorted(set(updated_wiki_files)))
         index_report = self._indexer.upsert_modified_files(changed_paths=changed_paths)
 
         return SyncReport(
@@ -213,7 +211,7 @@ class AutoIngestService:
             return "AGENTS.md unavailable."
 
     def _load_state(self) -> dict[str, str]:
-        path = self._settings.egnyte_state_path
+        path = self._settings.source_sync_state_path
         if not path.exists():
             return {}
         try:
@@ -222,7 +220,7 @@ class AutoIngestService:
             return {}
 
     def _save_state(self, state: dict[str, str]) -> None:
-        self._settings.egnyte_state_path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+        self._settings.source_sync_state_path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
     def _event_key(self, event: Any) -> str:
         fingerprint = [part for part in (event.modified_at, event.entry_id) if part]
@@ -232,27 +230,51 @@ class AutoIngestService:
 
     def _relative_from_event(self, event: Any) -> Path:
         normalized = event.path.strip("/")
-        sync_root = self._settings.egnyte_sync_root.strip("/")
-        if normalized.startswith(sync_root + "/"):
-            normalized = normalized[len(sync_root) + 1 :]
+        raw_root = self._settings.normalized_sharepoint_raw_root_path
+        if normalized == raw_root:
+            return Path()
+        if normalized.startswith(raw_root + "/"):
+            normalized = normalized[len(raw_root) + 1 :]
         return Path(normalized)
+
+    def _publish_changed_wiki_files(self, *, changed_relative_paths: list[str]) -> None:
+        for relative_path in changed_relative_paths:
+            if not relative_path.startswith("wiki/"):
+                continue
+            local_path = self._settings.repo_root / relative_path
+            if not local_path.exists():
+                continue
+            self._source_sync.upload_text_file(relative_path, local_path.read_text(encoding="utf-8"))
+
+    def _refresh_local_wiki_from_sharepoint(self) -> None:
+        wiki_root = self._settings.normalized_sharepoint_wiki_root_path
+        remote_events = self._source_sync.list_files_recursive(wiki_root)
+        for event in remote_events:
+            if Path(event.path).suffix.lower() != ".md":
+                continue
+
+            remote_path = event.path.strip("/")
+            if remote_path == wiki_root:
+                continue
+            if not remote_path.startswith(wiki_root + "/"):
+                continue
+
+            relative_path = remote_path[len(wiki_root) + 1 :]
+            local_destination = self._settings.wiki_root / relative_path
+            self._source_sync.download_remote_file(remote_path, local_destination)
 
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    parser = argparse.ArgumentParser(description="Run automated Egnyte ingest and wiki reindexing.")
-    parser.add_argument("--manual", action="store_true", help="Run a manual sync by enumerating the Egnyte Training Program CRD folder.")
-    parser.add_argument("--payload", help="Path to a JSON webhook payload file to replay.")
+    parser = argparse.ArgumentParser(description="Run automated SharePoint ingest and wiki reindexing.")
+    parser.add_argument("--manual", action="store_true", help="Run a manual sync by enumerating the authoritative SharePoint raw/sources folder.")
     args = parser.parse_args()
 
     service = AutoIngestService()
     if args.manual:
         report = service.sync_all_training_files()
-    elif args.payload:
-        payload = json.loads(Path(args.payload).read_text(encoding="utf-8"))
-        report = service.sync_from_webhook(payload)
     else:
-        parser.error("Choose either --manual or --payload.")
+        parser.error("Choose --manual.")
 
     LOGGER.info(
         "Sync complete requested=%s downloaded=%s updated_wiki=%s indexed=%s deleted=%s",

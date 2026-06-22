@@ -4,14 +4,14 @@ Graydaze PM Training Vault is a private wiki-backed Teams assistant for Graydaze
 
 ## Repository Purpose
 
-This repository now separates the runtime into thin service boundaries while keeping one-release compatibility shims for the older `rag_backend/` imports.
+This repository separates the runtime into thin service boundaries while keeping one-release compatibility shims for the older `rag_backend/` imports.
 
 The main layers are:
 
 - `wiki/`: the maintained knowledge base that the bot queries
 - `packages/`: shared contracts, document extraction, retrieval core, and ingest core
 - `apps/`: standalone HTTP apps for the Teams bot wrapper, wiki query API, and ingest API
-- `workers/`: background ingest workers that consume queued jobs
+- `workers/`: background sync workers that consume queued jobs
 - `teams_bot/` and `app.py`: the thin Microsoft Teams bot runtime and HTTP entrypoint
 - `rag_backend/`: compatibility wrappers over the extracted core modules
 
@@ -22,58 +22,71 @@ The bot retrieves only from `wiki/`. The `raw/` folder is used for source captur
 - Local embedded vector index for `wiki/` content using LanceDB
 - Markdown-aware chunking by `##` headings
 - YAML frontmatter parsing and metadata propagation into index rows
-- Provider-agnostic LLM configuration with runtime support for OpenAI, Azure OpenAI, Anthropic, and Google
+- Provider-agnostic LLM configuration with runtime support for OpenAI and Azure OpenAI (Microsoft AI Foundry)
 - Standalone `apps/wiki_query_api` query service
 - Standalone `apps/ingest_api` ingest service with Azure Service Bus job queueing
-- Background `workers/egnyte_ingest_worker` worker for manual sync and webhook-triggered ingest
+- Background `workers/source_sync_worker` worker for manual SharePoint-backed ingest
 - Teams bot with typing indicators, welcome message, and feedback buttons
-- Teams manual `/sync` command that queues an Egnyte refresh job
-- Egnyte webhook endpoint for queued background ingest and reindexing
+- Teams manual `/sync` command that queues a SharePoint refresh job
 - Attachment-aware Teams chat input for supported documents and images
 
 ## Architecture
 
+### SharePoint Source of Truth
+
+- The production source of truth is the remote SharePoint Online document library.
+- `raw/sources/` in SharePoint is the authoritative raw source layer.
+- `wiki/` in SharePoint is the authoritative maintained wiki layer.
+- A local SharePoint-synced folder is optional for development and inspection only. It is not a required production dependency.
+
+### Runtime Storage Model
+
+- The ingest/query runtime uses a local materialized working copy of the vault.
+- The runtime reads remote SharePoint source files through Microsoft Graph during sync.
+- Updated `wiki/` files are written locally first, then pushed back to SharePoint.
+- Vector DB files, manifests, and sync state should live outside any synced SharePoint workspace.
+
 ### Wiki Layer
 
-- `AGENTS.md` defines the vault operating contract
-- `wiki/index.md` is the primary navigation map
-- `wiki/log.md` tracks durable maintenance and ingest activity
-- `wiki/sources/`, `wiki/concepts/`, `wiki/entities/`, `wiki/syntheses/`, and `wiki/queries/` hold maintained knowledge pages
+- `AGENTS.md` defines the vault operating contract.
+- `wiki/index.md` is the primary navigation map.
+- `wiki/log.md` tracks durable maintenance and ingest activity.
+- `wiki/sources/`, `wiki/concepts/`, `wiki/entities/`, `wiki/syntheses/`, and `wiki/queries/` hold maintained knowledge pages.
 
 ### Retrieval Layer
 
-- `packages/wiki_core/retrieval/` contains the extracted indexing and query services
-- `packages/wiki_core/content/` contains markdown parsing and page store helpers
-- `packages/wiki_core/ai/` contains the current model gateway and legacy provider adapter
-- `apps/wiki_query_api/app.py` exposes the extracted query service over HTTP
-- `rag_backend/` remains as a compatibility layer over the extracted modules for one release
+- `packages/wiki_core/retrieval/` contains the extracted indexing and query services.
+- `packages/wiki_core/content/` contains markdown parsing and page store helpers.
+- `packages/wiki_core/ai/` contains the current model gateway and legacy provider adapter.
+- `apps/wiki_query_api/app.py` exposes the extracted query service over HTTP.
+- `rag_backend/` remains as a compatibility layer over the extracted modules for one release.
 
 ### Sync and Ingest Layer
 
-- `packages/wiki_core/ingest/` contains the extracted Egnyte adapter and ingest orchestration service
-- `packages/shared/documents/extract_text.py` extracts text from Office and PDF formats used during ingest and Teams attachment preprocessing
-- `packages/shared/messaging/service_bus.py` wraps Azure Service Bus send/receive helpers
-- `apps/ingest_api/app.py` accepts manual sync and Egnyte webhook requests, then queues jobs
-- `workers/egnyte_ingest_worker/worker.py` performs the actual ingest work from queued jobs
-- `scripts/extract_text.py` remains as a CLI wrapper over the shared extraction library
+- `packages/wiki_core/ingest/` contains the extracted SharePoint source adapter and ingest orchestration service.
+- `packages/shared/documents/extract_text.py` extracts text from Office and PDF formats used during ingest and Teams attachment preprocessing.
+- `packages/shared/messaging/service_bus.py` wraps Azure Service Bus send/receive helpers.
+- `apps/ingest_api/app.py` accepts manual sync requests and queues jobs.
+- `workers/source_sync_worker/worker.py` performs the actual ingest work from queued jobs.
+- `scripts/extract_text.py` remains as a CLI wrapper over the shared extraction library.
 
 ### Teams Layer
 
-- `app.py` exposes `/api/messages` and `/healthz`
-- `teams_bot/bot.py` handles chat, `/sync`, feedback, and attachment preprocessing
-- `teams_bot/services/wiki_query.py` adapts Teams requests to a local callable or remote HTTP query API
-- `teams_bot/services/ingest_admin_client.py` submits `/sync` requests to the remote ingest API
-- `teams_app/manifest.json` contains the Teams app package manifest
+- `app.py` exposes `/api/messages` and `/healthz`.
+- `teams_bot/bot.py` handles chat, `/sync`, feedback, and attachment preprocessing.
+- `teams_bot/services/wiki_query.py` adapts Teams requests to a local callable or remote HTTP query API.
+- `teams_bot/services/ingest_admin_client.py` submits `/sync` requests to the remote ingest API.
+- `teams_app/manifest.json` contains the Teams app package manifest.
 
 ## Key Design Decisions
 
-### Why LanceDB Instead of ChromaDB
+### Why Microsoft Graph For SharePoint Sync
 
-The original backend request allowed either ChromaDB or LanceDB. The implementation uses LanceDB because it installs and runs cleanly in the current Windows environment, while ChromaDB required a native `hnswlib` build that failed without local MSVC build tools.
+The ingest path now treats remote SharePoint Online as the authoritative upstream and uses Microsoft Graph for site, drive, folder, and file operations. This avoids any production dependency on one person’s local sync client or workstation.
 
-### Why Vector State Lives Outside the Repo by Default
+### Why LanceDB Still Lives Outside The Synced Vault
 
-The repository lives on an Egnyte UNC path. Embedded local databases are more reliable on a normal local filesystem path, so the default vector DB and sync state paths point at local app data unless explicitly overridden.
+Embedded local databases and sync state are more reliable on a normal local filesystem path than inside a synced SharePoint workspace. The default vector DB and sync state paths therefore point at local app data unless explicitly overridden.
 
 ### Why Queries Only Use `wiki/`
 
@@ -117,49 +130,15 @@ Optional:
 - `LLM_VISION_MODEL`
 - `LLM_EMBEDDING_PROVIDER`
 
-Routing behavior:
-
-- `LLM_CHAT_PROVIDER` falls back to `LLM_PROVIDER`
-- `LLM_VISION_PROVIDER` falls back to `LLM_CHAT_PROVIDER`, then `LLM_PROVIDER`
-- `LLM_EMBEDDING_PROVIDER` falls back to `LLM_PROVIDER`
-- `LLM_VISION_MODEL` falls back to `LLM_CHAT_MODEL`
-
 ### Provider Credential Blocks
 
 - OpenAI-compatible:
   - `LLM_OPENAI_API_KEY`
   - `LLM_OPENAI_BASE_URL`
-- Azure OpenAI:
+- Azure OpenAI (Microsoft AI Foundry project endpoints work here):
   - `LLM_AZURE_OPENAI_ENDPOINT`
   - `LLM_AZURE_OPENAI_API_KEY`
   - `LLM_AZURE_OPENAI_API_VERSION`
-- Anthropic:
-  - `LLM_ANTHROPIC_API_KEY`
-  - `LLM_ANTHROPIC_BASE_URL`
-- Google:
-  - `LLM_GOOGLE_API_KEY`
-  - `LLM_GOOGLE_BASE_URL`
-
-### Current Runtime Support
-
-The configuration scheme is provider-agnostic, and the current implemented runtime adapters support these chat/vision providers today:
-
-- `openai`
-- `azure-openai`
-- `anthropic`
-- `google`
-
-The current implemented embedding providers are:
-
-- `openai`
-- `azure-openai`
-- `google`
-
-Anthropic is not implemented for embeddings in the current runtime.
-
-### Vision Behavior
-
-If `LLM_VISION_MODEL` is not set, image requests fall back to `LLM_CHAT_MODEL`. In that case, the selected chat model must support image input if you want Teams image attachments to work.
 
 ## Environment Variables
 
@@ -182,6 +161,7 @@ See `.env.example` for the full list. The most important settings are:
   - `VECTOR_DB_PATH`
   - `VECTOR_TABLE_NAME`
   - `VECTOR_MANIFEST_PATH`
+  - `SOURCE_SYNC_STATE_PATH`
   - `RAG_TOP_K`
   - `RAG_INDEX_SUMMARY_CHARS`
 - LLM and embedding config:
@@ -194,15 +174,17 @@ See `.env.example` for the full list. The most important settings are:
   - `LLM_EMBEDDING_MODEL`
   - `LLM_OPENAI_*`
   - `LLM_AZURE_OPENAI_*`
-  - `LLM_ANTHROPIC_*`
-  - `LLM_GOOGLE_*`
-- Egnyte sync:
-  - `EGNYTE_DOMAIN`
-  - `EGNYTE_API_TOKEN`
-  - `EGNYTE_SYNC_ROOT`
-  - `EGNYTE_TRAINING_FOLDER_NAME`
-  - `EGNYTE_REQUEST_TIMEOUT_SECONDS`
-  - `EGNYTE_SYNC_STATE_PATH`
+- SharePoint source sync:
+  - `SHAREPOINT_TENANT_ID`
+  - `SHAREPOINT_CLIENT_ID`
+  - `SHAREPOINT_CLIENT_SECRET`
+  - `SHAREPOINT_SITE_ID` or `SHAREPOINT_SITE_HOSTNAME` + `SHAREPOINT_SITE_PATH`
+  - `SHAREPOINT_LIST_ID`, `SHAREPOINT_DRIVE_ID`, or `SHAREPOINT_DRIVE_NAME`
+  - `SHAREPOINT_RAW_ROOT_PATH`
+  - `SHAREPOINT_WIKI_ROOT_PATH`
+  - `SHAREPOINT_REQUEST_TIMEOUT_SECONDS`
+  - `SHAREPOINT_WEBHOOK_NOTIFICATION_URL` (public HTTPS endpoint Graph posts to)
+  - `SHAREPOINT_WEBHOOK_CLIENT_STATE` (shared secret echoed in every notification)
 - Queueing:
   - `SERVICE_BUS_CONNECTION_STRING`
   - `SERVICE_BUS_NAMESPACE`
@@ -218,7 +200,16 @@ python -m pip install -r requirements.txt
 
 ### 2. Configure environment
 
-Create a `.env` file based on `.env.example` and populate the required bot, model, Egnyte, and queue settings.
+Create a `.env` file based on `.env.example` and populate the required bot, model, SharePoint, and queue settings.
+
+The ingest runtime expects app-only Microsoft Graph access to the target SharePoint site and document library.
+
+The most reliable Phase 1 SharePoint configuration is:
+
+- `SHAREPOINT_SITE_ID` from Graph or SharePoint site metadata
+- `SHAREPOINT_LIST_ID` from the document library settings URL
+
+When `SHAREPOINT_LIST_ID` is set, the runtime resolves the drive internally and you do not need Graph Explorer to discover `SHAREPOINT_DRIVE_ID` manually.
 
 For a local split run, set:
 
@@ -245,10 +236,10 @@ python -m apps.wiki_query_api.app
 python -m apps.ingest_api.app
 ```
 
-### 6. Run the ingest worker
+### 6. Run the source sync worker
 
 ```bash
-python -m workers.egnyte_ingest_worker.worker
+python -m workers.source_sync_worker.worker
 ```
 
 ### 7. Run the bot locally
@@ -271,7 +262,6 @@ The standalone query API exposes:
 The ingest API exposes:
 
 - `POST /admin/sync`
-- `POST /api/webhooks/egnyte`
 - `GET /healthz`
 
 ## Operations
@@ -288,19 +278,13 @@ python -m rag_backend.indexer --mode build
 python -m rag_backend.indexer --mode upsert
 ```
 
-### Run the queued ingest worker
+### Run the queued source sync worker
 
 ```bash
-python -m workers.egnyte_ingest_worker.worker
+python -m workers.source_sync_worker.worker
 ```
 
-### Replay an Egnyte webhook payload locally with the legacy compatibility shim
-
-```bash
-python -m rag_backend.auto_ingest --payload path/to/payload.json
-```
-
-### Manual Egnyte sync with the legacy compatibility shim
+### Manual SharePoint sync with the compatibility shim
 
 ```bash
 python -m rag_backend.auto_ingest --manual
@@ -323,10 +307,6 @@ See `teams_app/README.md` for packaging details. Before publishing, you still ne
 - `outline.png`
 - A public HTTPS endpoint for the bot
 - A real Bot/Entra registration
-
-## Development Logs
-
-Backfilled engineering reports live under `docs/development-logs/`. They are named with `YYYY-MM-DD-phase-topic.md` so they sort naturally and remain easy to scan.
 
 ## Repository Notes
 

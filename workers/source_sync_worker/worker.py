@@ -1,0 +1,111 @@
+"""Background worker that consumes queued source sync jobs."""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from typing import Any
+
+from packages.contracts.sync import SourceFileEvent
+from packages.shared.documents.extract_text import SUPPORTED_EXTENSIONS
+from packages.shared.messaging.service_bus import process_queue_messages
+from packages.wiki_core.ingest.ingest_service import AutoIngestService
+
+from .config import WorkerSettings
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _load_processed_jobs(service: AutoIngestService) -> set[str]:
+    path = service._settings.sync_job_state_path
+    if not path.exists():
+        return set()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if not isinstance(payload, dict):
+        return set()
+    processed = payload.get("processed_job_ids")
+    if not isinstance(processed, list):
+        return set()
+    return {str(job_id) for job_id in processed if str(job_id).strip()}
+
+
+def _save_processed_jobs(service: AutoIngestService, processed_job_ids: set[str]) -> None:
+    path = service._settings.sync_job_state_path
+    payload = {"processed_job_ids": sorted(processed_job_ids)}
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _process_job(payload: dict[str, Any], service: AutoIngestService) -> None:
+    job_type = str(payload.get("job_type") or "")
+    job_id = str(payload.get("job_id") or "unknown")
+    processed_job_ids = _load_processed_jobs(service)
+
+    if job_id in processed_job_ids:
+        LOGGER.info("Skipping already processed source sync job job_id=%s job_type=%s", job_id, job_type)
+        return
+
+    LOGGER.info("Processing source sync job job_id=%s job_type=%s", job_id, job_type)
+
+    if job_type == "manual":
+        service.sync_all_training_files()
+        processed_job_ids.add(job_id)
+        _save_processed_jobs(service, processed_job_ids)
+        return
+
+    if job_type == "webhook":
+        job_payload = payload.get("payload") or {}
+        if not isinstance(job_payload, dict):
+            raise ValueError(f"Webhook job {job_id} has malformed payload: {job_payload!r}")
+        path = str(job_payload.get("path") or "").strip()
+        if not path:
+            raise ValueError(f"Webhook job {job_id} is missing a path.")
+        suffix = ""
+        if "." in path:
+            suffix = "." + path.rsplit(".", maxsplit=1)[1].lower()
+        if suffix not in SUPPORTED_EXTENSIONS:
+            LOGGER.info("Skipping webhook job for unsupported extension job_id=%s path=%s", job_id, path)
+            processed_job_ids.add(job_id)
+            _save_processed_jobs(service, processed_job_ids)
+            return
+
+        event = SourceFileEvent(
+            path=path,
+            event_type="webhook",
+            modified_at=(str(job_payload.get("modified_at")) if job_payload.get("modified_at") else None),
+            entry_id=(str(job_payload.get("entry_id")) if job_payload.get("entry_id") else None),
+        )
+        service.sync_events([event])
+        processed_job_ids.add(job_id)
+        _save_processed_jobs(service, processed_job_ids)
+        return
+
+    raise ValueError(f"Unsupported source sync job type: {job_type}")
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    settings = WorkerSettings.from_env()
+    settings.validate_queue()
+    service = AutoIngestService(settings.backend)
+
+    while True:
+        processed = process_queue_messages(
+            connection_string=settings.service_bus_connection_string,
+            fully_qualified_namespace=settings.service_bus_namespace,
+            queue_name=settings.service_bus_queue_name,
+            processor=lambda payload: _process_job(payload, service),
+            max_message_count=1,
+            max_wait_time=5,
+            treat_completion_lock_loss_as_processed=True,
+        )
+        if processed == 0:
+            time.sleep(2)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

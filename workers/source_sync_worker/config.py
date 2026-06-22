@@ -1,4 +1,4 @@
-"""Configuration for the Egnyte ingest worker."""
+"""Configuration for the source sync worker."""
 
 from __future__ import annotations
 

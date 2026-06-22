@@ -1,1 +1,0 @@
-"""Egnyte ingest worker package."""

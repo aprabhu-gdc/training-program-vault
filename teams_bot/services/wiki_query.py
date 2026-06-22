@@ -224,8 +224,8 @@ class HttpWikiQueryService:
     """HTTP-based adapter for a separately hosted wiki query service.
 
     Use this when the Teams bot cannot directly import the existing wiki backend,
-    for example when the backend runs on another machine that already has Egnyte
-    access or private network connectivity to the vault.
+    for example when the backend runs on another machine that hosts the service-
+    managed working copy of the vault.
     """
 
     def __init__(self, base_url: str, timeout_seconds: float = 45.0) -> None:
