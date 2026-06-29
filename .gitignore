@@ -10,6 +10,9 @@ venv/
 __pycache__/
 *.py[cod]
 
+# Built Teams app package output
+dist/
+
 # Local Obsidian state
 .obsidian/
 

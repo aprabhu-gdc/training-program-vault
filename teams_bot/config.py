@@ -37,6 +37,8 @@ class Settings:
 
     app_id: str
     app_password: str
+    app_type: str
+    app_tenant_id: str
     port: int
     wiki_query_callable: str
     wiki_query_http_url: str
@@ -51,6 +53,10 @@ class Settings:
         return cls(
             app_id=_read_env("MicrosoftAppId", "MICROSOFT_APP_ID"),
             app_password=_read_env("MicrosoftAppPassword", "MICROSOFT_APP_PASSWORD"),
+            # MultiTenant (default) suits local Bot Framework Emulator runs.
+            # SingleTenant is the right posture for an internal whole-company bot.
+            app_type=_read_env("MicrosoftAppType", "MICROSOFT_APP_TYPE", default="MultiTenant"),
+            app_tenant_id=_read_env("MicrosoftAppTenantId", "MICROSOFT_APP_TENANTID"),
             port=int(_read_env("PORT", default="3978")),
             wiki_query_callable=_read_env(
                 "WIKI_QUERY_CALLABLE",
@@ -81,6 +87,12 @@ class Settings:
             LOGGER.warning(
                 "MicrosoftAppId/MicrosoftAppPassword are empty. This is only suitable for local "
                 "Bot Framework Emulator-style testing and will not work for a real Teams deployment."
+            )
+
+        if self.app_type.strip().lower() == "singletenant" and not self.app_tenant_id:
+            LOGGER.warning(
+                "MicrosoftAppType=SingleTenant requires MicrosoftAppTenantId. Bot authentication "
+                "will fail to initialize until the tenant id is set."
             )
 
         if not self.ingest_admin_http_url:

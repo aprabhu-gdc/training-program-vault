@@ -2,28 +2,34 @@
 
 This folder contains the Microsoft Teams app manifest for the `Graydaze PM Training Vault` bot.
 
-## Before packaging
+## Building the package
 
-Replace these placeholders in `manifest.json`:
+Use the build script instead of editing `manifest.json` by hand. It substitutes
+the placeholders (`__TEAMS_APP_ID__`, `__BOT_APP_ID__`, `__BOT_HOSTNAME__`),
+validates the result, and zips `manifest.json` + the two icons into
+`dist/teams_app.zip`:
 
-- `__TEAMS_APP_ID__`
-  - A unique app package GUID for the Teams app manifest itself
-- `__BOT_APP_ID__`
-  - The Microsoft Entra app ID used by the Azure Bot registration
-- `__BOT_HOSTNAME__`
-  - The public HTTPS hostname serving `/api/messages`
+```bash
+python -m scripts.build_teams_package \
+    --bot-app-id <ENTRA_APP_CLIENT_ID> \
+    --host <app>.azurewebsites.net
+```
 
-## Required package contents
+- `--teams-app-id` is optional; it defaults to a stable GUID derived from the bot
+  id, so repeat builds produce the same package id. Pass your own to override.
+- Values may also be supplied via `BOT_APP_ID` / `BOT_HOSTNAME` / `TEAMS_APP_ID`.
 
-Zip these three files together when publishing to Teams:
+## Icons
 
-- `manifest.json`
-- `color.png` (192x192)
-- `outline.png` (32x32)
-
-The current repository does not include production icon assets yet, so add them before packaging.
+`color.png` (192x192) and `outline.png` (32x32) are committed as **placeholder**
+assets (Graydaze accent color). The build script regenerates them if missing.
+Replace both with real brand art before a wider rollout — overwrite the two files
+and rebuild.
 
 ## Publishing paths
 
-- Personal/test install: upload the app package in Teams Developer Portal or Teams client if sideloading is allowed
-- Org-wide availability: a Teams admin publishes the package to the tenant app catalog and can pin/allow it organization-wide
+- Pilot / test install (Stage 1): upload `dist/teams_app.zip` via the Teams client
+  "Upload a custom app" option or the Teams Developer Portal. A tenant admin may
+  need to allow custom app uploads for the pilot users.
+- Org-wide availability (Stage 2): a Teams admin publishes the package to the
+  tenant app catalog and can pin/allow it organization-wide.

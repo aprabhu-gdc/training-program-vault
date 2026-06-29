@@ -17,12 +17,15 @@ import os
 
 from aiohttp import web
 from botbuilder.core import (
-    BotFrameworkAdapter,
-    BotFrameworkAdapterSettings,
     ConversationState,
     MemoryStorage,
     TurnContext,
     UserState,
+)
+from botbuilder.integration.aiohttp import (
+    CloudAdapter,
+    ConfigurationBotFrameworkAuthentication,
+    ConfigurationServiceClientCredentialFactory,
 )
 from botbuilder.schema import Activity
 
@@ -40,6 +43,18 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 LOGGER = logging.getLogger(__name__)
+
+
+class _BotAuthConfig:
+    """Adapts our ``Settings`` to the attribute names the Bot Framework
+    configuration auth classes look up (``APP_ID``/``APP_PASSWORD``/``APP_TYPE``/
+    ``APP_TENANTID``)."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.APP_ID = settings.app_id
+        self.APP_PASSWORD = settings.app_password
+        self.APP_TYPE = settings.app_type
+        self.APP_TENANTID = settings.app_tenant_id
 
 
 def create_app() -> web.Application:
@@ -85,11 +100,16 @@ def create_app() -> web.Application:
         ingest_admin_client=ingest_admin_client,
     )
 
-    adapter_settings = BotFrameworkAdapterSettings(
-        settings.app_id,
-        settings.app_password,
+    # CloudAdapter + ConfigurationBotFrameworkAuthentication supports both
+    # MultiTenant (default, fine for the Bot Framework Emulator) and SingleTenant
+    # (the posture for an internal whole-company bot). The credential factory reads
+    # APP_ID / APP_PASSWORD / APP_TYPE / APP_TENANTID off this config shim.
+    auth_config = _BotAuthConfig(settings)
+    bot_auth = ConfigurationBotFrameworkAuthentication(
+        auth_config,
+        credentials_factory=ConfigurationServiceClientCredentialFactory(auth_config),
     )
-    adapter = BotFrameworkAdapter(adapter_settings)
+    adapter = CloudAdapter(bot_auth)
 
     async def on_turn_error(turn_context: TurnContext, error: Exception) -> None:
         """Global catch-all for exceptions that escape the bot logic.
@@ -137,9 +157,11 @@ def create_app() -> web.Application:
         auth_header = request.headers.get("Authorization", "")
 
         try:
+            # CloudAdapter.process_activity takes the auth header first, then the
+            # activity (the reverse of the legacy BotFrameworkAdapter order).
             invoke_response = await adapter.process_activity(
-                activity,
                 auth_header,
+                activity,
                 bot.on_turn,
             )
         except Exception as exc:  # pragma: no cover - defensive request-level guard
