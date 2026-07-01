@@ -41,6 +41,10 @@ OVERRIDES = {
     "MicrosoftAppType": "MultiTenant",
     # Make Oryx run `pip install -r requirements.txt` on git/zip deploy.
     "SCM_DO_BUILD_DURING_DEPLOYMENT": "true",
+    # The three processes each import lancedb/pyarrow/openai/botbuilder, so cold
+    # start is ~150s — above the 230s default but too close for comfort. Give it
+    # headroom so platform restarts don't time out and flap.
+    "WEBSITES_CONTAINER_START_TIME_LIMIT": "1800",
 }
 
 # Never push these from .env: bot creds (not created yet) and local/Windows-only
