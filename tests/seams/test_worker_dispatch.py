@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from workers.source_sync_worker import worker as worker_mod
 from workers.source_sync_worker.worker import _process_job
 
 
@@ -75,3 +76,26 @@ def test_duplicate_job_id_is_idempotent(tmp_path):
     _process_job(job, service)  # second time should be skipped
 
     assert service.sync_all_training_files.call_count == 1
+
+
+def _queue_settings():
+    return SimpleNamespace(
+        service_bus_connection_string="conn",
+        service_bus_namespace="",
+        service_bus_queue_name="q",
+    )
+
+
+def test_poll_once_swallows_transient_errors(monkeypatch):
+    # A transient AMQP/Service Bus error must not escape (it previously killed
+    # the worker, which nothing restarts).
+    def boom(**kwargs):
+        raise RuntimeError("AMQPLinkError: Link detached unexpectedly")
+
+    monkeypatch.setattr(worker_mod, "process_queue_messages", boom)
+    assert worker_mod._poll_once(_queue_settings(), object()) == 0
+
+
+def test_poll_once_returns_processed_count(monkeypatch):
+    monkeypatch.setattr(worker_mod, "process_queue_messages", lambda **kwargs: 3)
+    assert worker_mod._poll_once(_queue_settings(), object()) == 3

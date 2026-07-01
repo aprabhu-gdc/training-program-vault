@@ -87,14 +87,18 @@ def _process_job(payload: dict[str, Any], service: AutoIngestService) -> None:
     raise ValueError(f"Unsupported source sync job type: {job_type}")
 
 
-def main() -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    settings = WorkerSettings.from_env()
-    settings.validate_queue()
-    service = AutoIngestService(settings.backend)
+def _poll_once(settings: WorkerSettings, service: AutoIngestService) -> int:
+    """Run one receive/process cycle. Never raises.
 
-    while True:
-        processed = process_queue_messages(
+    Transient Service Bus / AMQP conditions (e.g. ``AMQPLinkError: Link detached
+    unexpectedly``) surface from ``receive_messages`` outside the per-message
+    try/except and would otherwise propagate out of the worker loop and kill the
+    process. Nothing restarts a crashed background worker, so we log and swallow
+    here and let the next cycle reconnect with a fresh client.
+    """
+
+    try:
+        return process_queue_messages(
             connection_string=settings.service_bus_connection_string,
             fully_qualified_namespace=settings.service_bus_namespace,
             queue_name=settings.service_bus_queue_name,
@@ -103,7 +107,19 @@ def main() -> int:
             max_wait_time=5,
             treat_completion_lock_loss_as_processed=True,
         )
-        if processed == 0:
+    except Exception:
+        LOGGER.exception("Source sync poll cycle failed; retrying after backoff")
+        return 0
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    settings = WorkerSettings.from_env()
+    settings.validate_queue()
+    service = AutoIngestService(settings.backend)
+
+    while True:
+        if _poll_once(settings, service) == 0:
             time.sleep(2)
 
 

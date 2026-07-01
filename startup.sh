@@ -10,6 +10,10 @@
 #   - Teams bot    -> the only PUBLIC process; binds $PORT (App Service routes
 #                     inbound HTTPS here, i.e. /api/messages)
 #
+# The two background processes are supervised: if either exits, it is relaunched.
+# Only the foreground bot keeps the container alive, so without this a crashed
+# worker/ingest-API would stay dead until the whole container recycled.
+#
 # Required App Service settings (Configuration > Application settings):
 #   PORT=8000              WEBSITES_PORT=8000
 #   INGEST_API_PORT=8010   (MUST be set; ingest config otherwise falls back to
@@ -20,17 +24,28 @@
 #   MicrosoftAppTenantId
 #   ...plus all existing LLM / SharePoint / Service Bus settings.
 # Enable "Always On" so the worker keeps running.
-set -euo pipefail
+#
+# Note: no `set -e` — a non-zero exit from a supervised child must not abort the
+# script; the restart loop handles it.
+set -uo pipefail
 
 log() { echo "[startup] $*"; }
 
-# Background: private ingest API (manual /sync endpoint).
-log "starting ingest API on port ${INGEST_API_PORT:-8010}"
-python -m apps.ingest_api.app &
+# Run a background process under a restart loop so a crash relaunches it.
+supervise() {
+  local name="$1"; shift
+  (
+    while true; do
+      log "starting ${name}"
+      "$@"
+      log "${name} exited ($?); restarting in 3s"
+      sleep 3
+    done
+  ) &
+}
 
-# Background: Service Bus sync worker.
-log "starting source sync worker"
-python -m workers.source_sync_worker.worker &
+supervise "ingest API (port ${INGEST_API_PORT:-8010})" python -m apps.ingest_api.app
+supervise "source sync worker" python -m workers.source_sync_worker.worker
 
 # Foreground (PID 1): the public Teams bot on $PORT.
 log "starting Teams bot on port ${PORT:-3978}"
