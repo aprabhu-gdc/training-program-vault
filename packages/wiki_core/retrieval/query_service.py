@@ -130,12 +130,19 @@ class QueryService:
 
     async def query(self, request: QueryRequest) -> QueryResponse:
         if not self._vector_store.is_ready():
-            raise RuntimeError("Wiki index is not ready. Build or refresh the index before serving queries.")
+            raise RuntimeError(
+                f"Wiki index is not ready at {self._settings.vector_db_path} "
+                f"(table '{self._settings.vector_table_name}'). Build or refresh the index before serving queries."
+            )
 
         attachments = _normalize_attachments(list(request.attachments))
         retrieval_query = _build_retrieval_query(request.query, attachments)
         query_embedding = (await self._model_gateway.embed_texts_async([retrieval_query]))[0]
         results = self._vector_store.search(query_embedding, top_k=self._settings.rag_top_k)
+        LOGGER.info(
+            "request_id=%s vault retrieval returned %d results (top_k=%d)",
+            request.request_id, len(results), self._settings.rag_top_k,
+        )
 
         chunks = [
             RetrievedChunk(
