@@ -97,6 +97,14 @@ class WikiQueryService:
         except Exception as exc:
             raise WikiIntegrationError("Wiki query callable raised an exception.") from exc
 
+        # Preserve structured results (with citations) when the callable returns a
+        # QueryResponse — e.g. rag_backend.query:query_vault_structured. Collapsing to
+        # text here would drop the citations the Sources card needs.
+        if isinstance(raw_result, QueryResponse):
+            if not raw_result.answer_text.strip():
+                raise WikiIntegrationError("Wiki query callable returned an empty answer.")
+            return raw_result
+
         answer_text = self._extract_answer_text(raw_result)
         if not answer_text:
             raise WikiIntegrationError("Wiki query callable returned an empty answer.")

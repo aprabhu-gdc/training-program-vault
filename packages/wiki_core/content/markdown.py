@@ -14,6 +14,7 @@ import yaml
 
 _WIKILINK_WITH_ALIAS = re.compile(r"\[\[([^\]|]+)\|([^\]]+)\]\]")
 _WIKILINK_SIMPLE = re.compile(r"\[\[([^\]]+)\]\]")
+_SOURCE_TAG = re.compile(r"[ \t]*\[\s*sources?\s*:[^\]]*\]", re.IGNORECASE)
 MAX_CHUNK_CHARS = 6000
 
 
@@ -271,6 +272,19 @@ def clean_obsidian_links(text: str) -> str:
 
     text = _WIKILINK_WITH_ALIAS.sub(replace_with_alias, text)
     return _WIKILINK_SIMPLE.sub(replace_simple, text)
+
+
+def strip_source_tags(text: str) -> str:
+    """Remove any inline ``[Source: ...]`` / ``[Sources: ...]`` tags from answer text.
+
+    The model is instructed not to emit these (cited sources are shown separately in
+    the Teams card), but this is a defensive backstop so a stray tag never leaks into
+    the rendered answer. Leading spaces before a tag are consumed, and doubled spaces
+    left behind are collapsed.
+    """
+
+    cleaned = _SOURCE_TAG.sub("", text)
+    return re.sub(r"[ \t]{2,}", " ", cleaned)
 
 
 def slugify(text: str) -> str:

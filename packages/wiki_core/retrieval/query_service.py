@@ -9,7 +9,7 @@ from packages.contracts.identity import CallerIdentity
 from packages.contracts.query import Citation, QueryAttachment, QueryRequest, QueryResponse
 from packages.wiki_core.ai.legacy_provider_gateway import LegacyProviderGateway
 from packages.wiki_core.content.file_page_store import FilePageStore
-from packages.wiki_core.content.markdown import clean_obsidian_links, parse_sources_metadata
+from packages.wiki_core.content.markdown import clean_obsidian_links, parse_sources_metadata, strip_source_tags
 from packages.wiki_core.retrieval.lancedb_adapter import LanceDbVectorStore
 from packages.wiki_core.retrieval.models import RetrievedChunk
 from packages.wiki_core.settings import CoreSettings
@@ -25,13 +25,21 @@ def _build_system_prompt(index_summary: str) -> str:
         "Do not use outside knowledge, do not speculate, and explicitly say when the wiki context is insufficient.\n\n"
         "Vault map summary from wiki/index.md:\n"
         f"{index_summary}\n\n"
-        "Rules:\n"
-        "- Every factual sentence grounded in retrieved context must end with a citation in the exact format [Source: Title].\n"
-        "- Uploaded attachment content is user-supplied context, not a wiki source. Do not fabricate [Source: ...] citations for the attachment itself.\n"
-        "- If a sentence is supported by multiple chunks from the same title, cite it once with that title.\n"
-        "- If retrieved context conflicts, state the conflict explicitly and cite each claim separately.\n"
-        "- Convert Obsidian wikilinks into plain bold labels for Teams, for example [[wiki/concepts/etc|Estimate to Complete]] becomes **Estimate to Complete**.\n"
-        "- Do not emit raw wikilink syntax anywhere in the answer.\n"
+        "Grounding rules:\n"
+        "- Use only the retrieved wiki context and the summary above. If they are insufficient, say so plainly.\n"
+        "- Uploaded attachment content is user-supplied context, not a wiki source.\n"
+        "- If retrieved context conflicts, state the conflict explicitly.\n"
+        "- Do NOT add inline citations or source tags. Never write '[Source: ...]' or '[Sources: ...]' "
+        "anywhere in the answer — the cited sources are shown to the user separately.\n\n"
+        "Formatting rules (the answer is rendered as Markdown in Microsoft Teams — optimize for quick scanning):\n"
+        "- Separate distinct ideas into short paragraphs with a blank line between them; keep paragraphs to 2-3 sentences.\n"
+        "- Use short **bold section labels** and bulleted lists for steps, options, or criteria.\n"
+        "- **Bold** key terms, metrics, and definitions on first mention.\n"
+        "- For any math or formulas use plain Unicode (for example: EAC = AC + ETC, CPI = EV ÷ AC, x², √x, Σ). "
+        "Never use LaTeX or $...$ delimiters — Teams cannot render them.\n"
+        "- Convert Obsidian wikilinks into plain bold labels, for example [[wiki/concepts/etc|Estimate to Complete]] "
+        "becomes **Estimate to Complete**. Never emit raw wikilink syntax ([[...]]).\n"
+        "- Do not use Markdown tables (Teams strips them) or heading levels; use bold labels instead.\n"
         "- Keep the answer concise and useful for Graydaze PMs.\n"
     )
 
@@ -185,7 +193,11 @@ class QueryService:
             "chunk_ids": [str(chunk.metadata.get("id", "")) for chunk in chunks],
             "top_k": self._settings.rag_top_k,
         }
-        return QueryResponse(answer_text=clean_obsidian_links(answer), citations=citations, retrieval_diagnostics=diagnostics)
+        return QueryResponse(
+            answer_text=strip_source_tags(clean_obsidian_links(answer)),
+            citations=citations,
+            retrieval_diagnostics=diagnostics,
+        )
 
 
 async def query_vault_structured(query: str, request_id: str, **kwargs) -> QueryResponse:

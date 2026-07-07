@@ -72,7 +72,9 @@ async def test_query_returns_answer_and_citations(core_settings):
     service = _service(core_settings, [ROW])
     resp = await service.query(_request())
 
-    assert resp.answer_text == "The answer is grounded. [Source: My Title]"
+    # Inline [Source: ...] tags are stripped from the prose (the model is told not to
+    # emit them); the source is surfaced structurally via resp.citations instead.
+    assert resp.answer_text == "The answer is grounded."
     assert len(resp.citations) == 1
     citation = resp.citations[0]
     assert citation.title == "My Title"

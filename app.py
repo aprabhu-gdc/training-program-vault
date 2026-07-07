@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 
 from aiohttp import web
 from botbuilder.core import (
@@ -35,13 +34,12 @@ from teams_bot.services.feedback import FeedbackLogger
 from teams_bot.services.ingest_admin_client import HttpIngestAdminClient
 from teams_bot.services.wiki_query import HttpWikiQueryService, WikiQueryService
 
+from packages.shared.logging import configure_logging
 
-# Configure process-wide logging once at startup. The format keeps the output
-# readable in container logs, Azure App Service logs, or local terminal runs.
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
+
+# Configure process-wide logging once at startup (shared LOG_LEVEL handling plus
+# Azure SDK noise suppression, consistent across the bot, ingest API, and worker).
+configure_logging()
 LOGGER = logging.getLogger(__name__)
 
 

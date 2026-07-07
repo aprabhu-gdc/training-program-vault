@@ -9,6 +9,7 @@ from typing import Any
 
 from packages.contracts.sync import SourceFileEvent
 from packages.shared.documents.extract_text import SUPPORTED_EXTENSIONS
+from packages.shared.logging import configure_logging
 from packages.shared.messaging.service_bus import process_queue_messages
 from packages.wiki_core.ingest.ingest_service import AutoIngestService
 
@@ -113,7 +114,7 @@ def _poll_once(settings: WorkerSettings, service: AutoIngestService) -> int:
 
 
 def main() -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    configure_logging()
     settings = WorkerSettings.from_env()
     settings.validate_queue()
     service = AutoIngestService(settings.backend)

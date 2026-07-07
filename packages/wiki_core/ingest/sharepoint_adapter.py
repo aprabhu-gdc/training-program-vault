@@ -33,6 +33,7 @@ class SharePointSourceSyncAdapter:
         self._resolved_site_id = self._settings.sharepoint_site_id.strip()
         self._configured_list_id = self._settings.sharepoint_list_id.strip()
         self._resolved_drive_id = self._settings.sharepoint_drive_id.strip()
+        self._resolved_drive_web_url = ""
 
     def parse_webhook_payload(self, payload: Any) -> list[SourceFileEvent]:
         if not isinstance(payload, dict):
@@ -333,6 +334,28 @@ class SharePointSourceSyncAdapter:
                     return drive_id
 
         raise ValueError(f"Could not find SharePoint drive named {self._settings.sharepoint_drive_name!r}.")
+
+    def drive_web_url(self) -> str:
+        """Return the browser-openable ``webUrl`` of the document library (drive) root.
+
+        Used to build read-only links to source files. Cached on the instance so a
+        single Graph call serves every link for the process lifetime.
+        """
+
+        if self._resolved_drive_web_url:
+            return self._resolved_drive_web_url
+
+        url = f"{self.GRAPH_BASE_URL}/drives/{self._drive_id()}"
+        with httpx.Client(timeout=self._timeout, headers=self._authorized_headers()) as client:
+            response = client.get(url)
+            response.raise_for_status()
+            payload = response.json()
+
+        web_url = str(payload.get("webUrl") or "").strip()
+        if not web_url:
+            raise ValueError("Microsoft Graph drive lookup did not return a webUrl.")
+        self._resolved_drive_web_url = web_url
+        return web_url
 
     def _graph_drive_item_url(self, path: str) -> str:
         normalized_path = quote(path.strip("/"), safe="/")

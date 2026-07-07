@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import uuid
 
 from aiohttp import web
@@ -16,12 +15,10 @@ from packages.wiki_core.ingest.sharepoint_adapter import SharePointSourceSyncAda
 from packages.wiki_core.settings import CoreSettings
 
 from .config import IngestQueueSettings
+from packages.shared.logging import configure_logging
 
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
+configure_logging()
 LOGGER = logging.getLogger(__name__)
 
 
