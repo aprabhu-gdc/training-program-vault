@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 
 from aiohttp import web
 
@@ -13,12 +12,10 @@ from packages.contracts.query import QueryAttachment, QueryRequest
 from packages.wiki_core.retrieval.query_service import QueryService
 
 from .config import QueryApiSettings
+from packages.shared.logging import configure_logging
 
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
+configure_logging()
 LOGGER = logging.getLogger(__name__)
 
 

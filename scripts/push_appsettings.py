@@ -34,7 +34,7 @@ OVERRIDES = {
     "WEBSITES_PORT": "8000",
     "INGEST_API_PORT": "8010",
     "INGEST_ADMIN_HTTP_URL": "http://localhost:8010",
-    "WIKI_QUERY_CALLABLE": "rag_backend.query:query_vault",
+    "WIKI_QUERY_CALLABLE": "rag_backend.query:query_vault_structured",
     "LOCAL_DATA_ROOT": "/home/data",
     "VAULT_ROOT": "/home/data/vault",
     # Deferred until the bot app registration exists; MultiTenant boots with blank creds.

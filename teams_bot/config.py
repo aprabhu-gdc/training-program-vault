@@ -60,7 +60,7 @@ class Settings:
             port=int(_read_env("PORT", default="3978")),
             wiki_query_callable=_read_env(
                 "WIKI_QUERY_CALLABLE",
-                default="rag_backend.query:query_vault",
+                default="rag_backend.query:query_vault_structured",
             ),
             wiki_query_http_url=_read_env("WIKI_QUERY_HTTP_URL"),
             ingest_admin_http_url=_read_env("INGEST_ADMIN_HTTP_URL"),

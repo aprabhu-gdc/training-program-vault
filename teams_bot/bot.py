@@ -22,10 +22,11 @@ from botbuilder.schema import Activity, ActivityTypes, Attachment, InvokeRespons
 from packages.contracts.identity import CallerIdentity
 from packages.contracts.query import QueryAttachment, QueryRequest
 from packages.shared.documents.extract_text import SUPPORTED_EXTENSIONS, extract_text
-from teams_bot.cards import build_feedback_card
+from teams_bot.cards import build_answer_card
 from teams_bot.config import Settings
 from teams_bot.services.feedback import FeedbackEvent, FeedbackLogger
 from teams_bot.services.ingest_admin_client import HttpIngestAdminClient
+from teams_bot.services.source_links import SourceLinkResolver
 from teams_bot.services.wiki_query import (
     WikiIntegrationError,
     WikiQueryService,
@@ -55,6 +56,7 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         self._wiki_query_service = wiki_query_service
         self._feedback_logger = feedback_logger
         self._ingest_admin_client = ingest_admin_client
+        self._source_links = SourceLinkResolver()
         # Use a simple boolean property rather than a custom object so the state
         # remains JSON-serializable across real storage providers.
         self._welcome_accessor = self._user_state.create_property("HasSeenWelcome")
@@ -165,7 +167,13 @@ class GraydazeTrainingBot(TeamsActivityHandler):
             answer_activity = Activity(
                 type=ActivityTypes.message,
                 text=result.answer_text,
-                attachments=[build_feedback_card(request.request_id)],
+                text_format="markdown",
+                attachments=[
+                    build_answer_card(
+                        request.request_id,
+                        sources=self._build_source_links(getattr(result, "citations", ())),
+                    )
+                ],
             )
             await turn_context.send_activity(answer_activity)
         except WikiIntegrationError as exc:
@@ -177,6 +185,27 @@ class GraydazeTrainingBot(TeamsActivityHandler):
             typing_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await typing_task
+
+    def _build_source_links(self, citations: Any) -> list[dict[str, Any]]:
+        """Dedupe citations by wiki page and resolve read-only SharePoint links.
+
+        Returns a list of ``{"title", "url"}`` dicts for the Sources card. ``url`` is
+        None when a SharePoint link can't be resolved, in which case the card shows
+        the title as plain text.
+        """
+
+        sources: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for citation in citations or ():
+            path = str(getattr(citation, "path", "") or "")
+            title = str(getattr(citation, "title", "") or "").strip() or "Untitled"
+            key = path or title
+            if key in seen:
+                continue
+            seen.add(key)
+            url = self._source_links.link_for(path) if path else None
+            sources.append({"title": title, "url": url})
+        return sources
 
     async def on_invoke_activity(self, turn_context: TurnContext) -> InvokeResponse:
         """Handle invoke-style submissions such as some Adaptive Card actions.
