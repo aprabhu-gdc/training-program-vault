@@ -7,6 +7,7 @@ from packages.contracts.identity import CallerIdentity
 from packages.contracts.query import Citation, QueryRequest, QueryResponse
 from packages.wiki_core.content.markdown import strip_source_tags
 from teams_bot.cards import build_answer_card
+from teams_bot.services.source_links import SourceLinkResolver
 from teams_bot.services.wiki_query import WikiQueryService
 
 
@@ -82,3 +83,25 @@ async def test_wiki_query_service_preserves_citations_from_structured_result():
     assert len(result.citations) == 1
     assert result.citations[0].title == "T"
     assert result.citations[0].path == "wiki/t.md"
+
+
+def _resolver_with_base(base):
+    resolver = SourceLinkResolver()
+    resolver._attempted = True  # skip the live drive lookup
+    resolver._base_url = base
+    return resolver
+
+
+def test_source_link_appends_web_param_to_open_in_viewer():
+    resolver = _resolver_with_base("https://host/Training%20Program%20Vault")
+    assert (
+        resolver.link_for("wiki/concepts/etc.md")
+        == "https://host/Training%20Program%20Vault/wiki/concepts/etc.md?web=1"
+    )
+    # Leading/trailing slashes are normalized before the ?web=1 suffix.
+    assert resolver.link_for("/wiki/x.md/") == "https://host/Training%20Program%20Vault/wiki/x.md?web=1"
+
+
+def test_source_link_returns_none_when_base_unresolved():
+    resolver = _resolver_with_base(None)
+    assert resolver.link_for("wiki/x.md") is None

@@ -58,4 +58,6 @@ class SourceLinkResolver:
         base = self._drive_base()
         if not base:
             return None
-        return f"{base}/{quote(rel, safe='/')}"
+        # ?web=1 forces SharePoint's in-browser viewer (which renders the page) instead
+        # of serving the .md file as a download.
+        return f"{base}/{quote(rel, safe='/')}?web=1"
