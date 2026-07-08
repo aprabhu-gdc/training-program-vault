@@ -111,26 +111,42 @@ def test_source_link_returns_none_when_base_unresolved():
 # --- Markdown -> Adaptive Card renderer ---
 
 
-def test_markdown_headings_render_as_sized_bold_textblocks():
+def test_markdown_headings_render_as_strong_bold_textblocks():
     els = markdown_to_adaptive_elements("## Overview\n\nBody text.\n\n### Detail\n\nMore.")
     headers = [e for e in els if e.get("weight") == "Bolder"]
     assert [h["text"] for h in headers] == ["Overview", "Detail"]
-    assert headers[0]["size"] == "Medium" and headers[0]["separator"] is True
-    assert headers[1]["size"] == "Default"
+    assert headers[0]["size"] == "Large" and headers[0]["separator"] is True and headers[0]["color"] == "Accent"
+    assert headers[1]["size"] == "Medium"
     bodies = [e["text"] for e in els if e.get("weight") != "Bolder"]
     assert "Body text." in bodies and "More." in bodies
 
 
-def test_markdown_bullets_collapse_into_one_list_textblock():
+def test_markdown_bullets_render_as_individual_items():
     els = markdown_to_adaptive_elements("Steps:\n\n- First\n- Second\n- Third")
-    list_blocks = [e for e in els if "\r" in e["text"]]
-    assert len(list_blocks) == 1
-    assert list_blocks[0]["text"] == "- First\r- Second\r- Third"
+    bullets = [e["text"] for e in els if e["text"].startswith("•")]
+    assert bullets == ["• First", "• Second", "• Third"]
 
 
-def test_markdown_numbered_list_preserves_numbers():
-    els = markdown_to_adaptive_elements("1. One\n2. Two")
-    assert any(e["text"] == "1. One\r2. Two" for e in els)
+def test_markdown_numbered_items_increment():
+    els = markdown_to_adaptive_elements("1. One\n2. Two\n3. Three")
+    numbered = [e["text"] for e in els if e["text"][:2] in ("1.", "2.", "3.")]
+    assert numbered == ["1. One", "2. Two", "3. Three"]
+
+
+def test_numbered_sections_keep_counting_across_nested_bullets():
+    # Regression: previously every interrupted ordered item rendered as "1.".
+    md = "1. Alpha\n    - a\n    - b\n2. Bravo\n    - c\n3. Charlie"
+    els = markdown_to_adaptive_elements(md)
+    ordered = [e["text"] for e in els if e["text"][:2] in ("1.", "2.", "3.")]
+    assert ordered == ["1. Alpha", "2. Bravo", "3. Charlie"]
+    nested = [e["text"] for e in els if e["text"].startswith(" ")]
+    assert nested and all("•" in t for t in nested)
+
+
+def test_heading_resets_numbering_for_new_section():
+    els = markdown_to_adaptive_elements("## S1\n\n1. one\n2. two\n\n## S2\n\n1. reset")
+    ordered = [e["text"] for e in els if e["text"][:2] in ("1.", "2.")]
+    assert ordered == ["1. one", "2. two", "1. reset"]
 
 
 def test_markdown_empty_falls_back_to_single_block():
@@ -138,8 +154,9 @@ def test_markdown_empty_falls_back_to_single_block():
     assert len(els) == 1 and els[0]["type"] == "TextBlock"
 
 
-def test_answer_card_renders_answer_before_sections():
+def test_answer_card_is_full_width_and_renders_answer_before_sections():
     att = build_answer_card("req-1", "## Overview\n\nThe body.", sources=[{"title": "S", "url": "https://x/y.md"}])
+    assert att.content["msteams"]["width"] == "Full"
     body = _body(att)
     assert body[0]["text"] == "Overview" and body[0]["weight"] == "Bolder"
     assert _by_id(body, "sourcesSection")["isVisible"] is False
