@@ -166,11 +166,11 @@ class GraydazeTrainingBot(TeamsActivityHandler):
 
             answer_activity = Activity(
                 type=ActivityTypes.message,
-                text=result.answer_text,
-                text_format="markdown",
+                text=self._answer_preview(result.answer_text),
                 attachments=[
                     build_answer_card(
                         request.request_id,
+                        result.answer_text,
                         sources=self._build_source_links(getattr(result, "citations", ())),
                     )
                 ],
@@ -206,6 +206,23 @@ class GraydazeTrainingBot(TeamsActivityHandler):
             url = self._source_links.link_for(path) if path else None
             sources.append({"title": title, "url": url})
         return sources
+
+    @staticmethod
+    def _answer_preview(answer_text: str, limit: int = 160) -> str:
+        """One-line plain-text preview of the answer for the message ``text`` field.
+
+        The full, formatted answer lives in the Adaptive Card; this drives the Teams
+        notification/toast and the accessibility summary without duplicating the whole
+        answer above the card.
+        """
+
+        for raw_line in (answer_text or "").splitlines():
+            line = re.sub(r"^#{1,6}\s*", "", raw_line.strip())  # heading markers
+            line = re.sub(r"^[-*>]\s+", "", line)               # list / quote markers
+            line = re.sub(r"[*_`]+", "", line).strip()          # inline emphasis / code
+            if line:
+                return line if len(line) <= limit else line[:limit].rstrip() + "…"
+        return "Here's what I found in the PM Training Vault."
 
     async def on_invoke_activity(self, turn_context: TurnContext) -> InvokeResponse:
         """Handle invoke-style submissions such as some Adaptive Card actions.
