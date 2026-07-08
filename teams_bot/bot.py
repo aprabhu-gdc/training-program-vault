@@ -208,21 +208,28 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         return sources
 
     @staticmethod
-    def _answer_preview(answer_text: str, limit: int = 160) -> str:
-        """One-line plain-text preview of the answer for the message ``text`` field.
+    def _answer_preview(answer_text: str, limit: int = 90) -> str:
+        """Short, non-duplicative preview for the message ``text`` field.
 
-        The full, formatted answer lives in the Adaptive Card; this drives the Teams
-        notification/toast and the accessibility summary without duplicating the whole
-        answer above the card.
+        The full formatted answer lives in the Adaptive Card, so this only drives the Teams
+        notification/toast and the accessibility summary. Prefer the first section header (a
+        short title) so it doesn't repeat the answer's opening paragraph shown in the card.
         """
 
-        for raw_line in (answer_text or "").splitlines():
-            line = re.sub(r"^#{1,6}\s*", "", raw_line.strip())  # heading markers
-            line = re.sub(r"^[-*>]\s+", "", line)               # list / quote markers
-            line = re.sub(r"[*_`]+", "", line).strip()          # inline emphasis / code
-            if line:
-                return line if len(line) <= limit else line[:limit].rstrip() + "…"
-        return "Here's what I found in the PM Training Vault."
+        def _clip(text: str) -> str:
+            text = text.strip()
+            return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+        lines = [ln.strip() for ln in (answer_text or "").splitlines() if ln.strip()]
+        for line in lines:
+            heading = re.match(r"^#{1,6}\s+(.*\S)\s*$", line)
+            if heading:
+                return _clip(re.sub(r"[*_`]+", "", heading.group(1)))
+        for line in lines:
+            plain = re.sub(r"[*_`]+", "", re.sub(r"^[-*>]\s+", "", re.sub(r"^#{1,6}\s*", "", line)))
+            if plain.strip():
+                return _clip(plain)
+        return "Answer from the PM Training Vault."
 
     async def on_invoke_activity(self, turn_context: TurnContext) -> InvokeResponse:
         """Handle invoke-style submissions such as some Adaptive Card actions.

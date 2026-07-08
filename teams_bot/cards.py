@@ -96,6 +96,8 @@ def build_answer_card(
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "type": "AdaptiveCard",
         "version": "1.4",
+        # Teams-specific: render the card at the full available message width.
+        "msteams": {"width": "Full"},
         "body": body,
     }
     return CardFactory.adaptive_card(card)
