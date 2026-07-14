@@ -32,6 +32,8 @@ class Citation:
     path: str
     section: str | None = None
     sources: tuple[str, ...] = ()
+    # Wiki page type from frontmatter (concept | source | entity | index).
+    page_type: str | None = None
 
 
 @dataclass(frozen=True)

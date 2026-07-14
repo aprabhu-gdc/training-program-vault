@@ -55,10 +55,28 @@ def test_answer_card_omits_sources_section_when_empty():
 def test_answer_card_preserves_feedback_payload():
     att = build_answer_card("req-42", "Lead paragraph.")
     feedback = _by_id(_body(att), "feedbackSection")
-    action_set = feedback["items"][1]
+    action_set = feedback["items"][-1]
     payloads = [a["data"] for a in action_set["actions"]]
-    assert {"action": "feedback", "feedback": "helpful", "request_id": "req-42"} in payloads
-    assert {"action": "feedback", "feedback": "inaccurate", "request_id": "req-42"} in payloads
+    assert {"action": "feedback", "feedback": "helpful", "request_id": "req-42", "concepts": []} in payloads
+    assert {"action": "feedback", "feedback": "inaccurate", "request_id": "req-42", "concepts": []} in payloads
+
+
+def test_answer_card_feedback_carries_comment_input_and_concepts():
+    att = build_answer_card("req-7", "Lead paragraph.", concepts=("Estimate to Complete",))
+    feedback = _by_id(_body(att), "feedbackSection")
+    comment = next(item for item in feedback["items"] if item.get("id") == "comment")
+    assert comment["type"] == "Input.Text"
+    assert comment["isMultiline"] is True
+    assert comment["maxLength"] == 1000
+    action_set = feedback["items"][-1]
+    assert all(a["data"]["concepts"] == ["Estimate to Complete"] for a in action_set["actions"])
+
+
+def test_answer_card_ends_with_privacy_footer():
+    att = build_answer_card("req-1", "Lead paragraph.")
+    footer = _body(att)[-1]
+    assert footer["type"] == "TextBlock"
+    assert "never stored" in footer["text"]
 
 
 async def test_wiki_query_service_preserves_citations_from_structured_result():

@@ -10,18 +10,22 @@ from botbuilder.schema import Attachment
 from teams_bot.markdown_card import markdown_to_adaptive_elements
 
 
-def _feedback_buttons(request_id: str) -> list[dict[str, Any]]:
+def _feedback_buttons(request_id: str, concepts: tuple[str, ...] = ()) -> list[dict[str, Any]]:
+    # `data` must stay a JSON object (not a string) so Teams merges the card's
+    # Input values (the optional comment) into `activity.value` on submit. The
+    # matched concepts ride along so feedback rows can be joined to concepts
+    # without any server-side request state.
+    def _data(feedback: str) -> dict[str, Any]:
+        return {
+            "action": "feedback",
+            "feedback": feedback,
+            "request_id": request_id,
+            "concepts": list(concepts),
+        }
+
     return [
-        {
-            "type": "Action.Submit",
-            "title": "👍 Helpful",
-            "data": {"action": "feedback", "feedback": "helpful", "request_id": request_id},
-        },
-        {
-            "type": "Action.Submit",
-            "title": "👎 Inaccurate",
-            "data": {"action": "feedback", "feedback": "inaccurate", "request_id": request_id},
-        },
+        {"type": "Action.Submit", "title": "👍 Helpful", "data": _data("helpful")},
+        {"type": "Action.Submit", "title": "👎 Inaccurate", "data": _data("inaccurate")},
     ]
 
 
@@ -29,6 +33,7 @@ def build_answer_card(
     request_id: str,
     answer_markdown: str,
     sources: list[dict[str, Any]] | None = None,
+    concepts: tuple[str, ...] = (),
 ) -> Attachment:
     """Adaptive Card rendering the answer plus collapsed Sources and Feedback sections.
 
@@ -87,8 +92,25 @@ def build_answer_card(
                     "size": "Small",
                     "isSubtle": True,
                 },
-                {"type": "ActionSet", "actions": _feedback_buttons(request_id)},
+                {
+                    "type": "Input.Text",
+                    "id": "comment",
+                    "isMultiline": True,
+                    "maxLength": 1000,
+                    "placeholder": "Optional: tell us what was helpful or missing",
+                },
+                {"type": "ActionSet", "actions": _feedback_buttons(request_id, concepts)},
             ],
+        }
+    )
+    body.append(
+        {
+            "type": "TextBlock",
+            "text": "Topic and feedback usage is logged for training analytics — your question text is never stored.",
+            "wrap": True,
+            "size": "Small",
+            "isSubtle": True,
+            "spacing": "Small",
         }
     )
 

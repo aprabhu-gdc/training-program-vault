@@ -80,6 +80,7 @@ async def test_query_returns_answer_and_citations(core_settings):
     assert citation.title == "My Title"
     assert citation.path == "wiki/sources/x.md"
     assert citation.sources == ("raw/sources/x.docx",)
+    assert citation.page_type == "source"
     assert resp.retrieval_diagnostics["top_k"] == core_settings.rag_top_k
     assert resp.retrieval_diagnostics["chunk_ids"] == ["chunk-1"]
 

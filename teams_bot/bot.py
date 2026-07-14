@@ -24,6 +24,7 @@ from packages.contracts.query import QueryAttachment, QueryRequest
 from packages.shared.documents.extract_text import SUPPORTED_EXTENSIONS, extract_text
 from teams_bot.cards import build_answer_card
 from teams_bot.config import Settings
+from teams_bot.services.analytics import AnalyticsService, derive_concepts
 from teams_bot.services.feedback import FeedbackEvent, FeedbackLogger
 from teams_bot.services.ingest_admin_client import HttpIngestAdminClient
 from teams_bot.services.source_links import SourceLinkResolver
@@ -48,6 +49,7 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         wiki_query_service: WikiQueryService,
         feedback_logger: FeedbackLogger,
         ingest_admin_client: HttpIngestAdminClient,
+        analytics: AnalyticsService | None = None,
     ) -> None:
         super().__init__()
         self._settings = settings
@@ -56,6 +58,9 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         self._wiki_query_service = wiki_query_service
         self._feedback_logger = feedback_logger
         self._ingest_admin_client = ingest_admin_client
+        self._analytics = analytics or AnalyticsService()
+        # Strong references keep fire-and-forget analytics tasks alive until done.
+        self._analytics_tasks: set[asyncio.Task] = set()
         self._source_links = SourceLinkResolver()
         # Use a simple boolean property rather than a custom object so the state
         # remains JSON-serializable across real storage providers.
@@ -154,16 +159,19 @@ class GraydazeTrainingBot(TeamsActivityHandler):
                 client_context={"channel_data": turn_context.activity.channel_data},
             )
 
+            # Log the query's length, not its text: question content is user data
+            # and stays out of app logs (same posture as the analytics pipeline).
             LOGGER.info(
-                "Dispatching Teams query request_id=%s user_id=%s conversation_id=%s text=%r",
+                "Dispatching Teams query request_id=%s user_id=%s conversation_id=%s query_chars=%d",
                 request.request_id,
                 request.identity.user_id,
                 request.identity.conversation_id,
-                request.query,
+                len(request.query),
             )
 
             result = await self._wiki_query_service.query(request)
 
+            concepts = derive_concepts(getattr(result, "citations", ()))
             answer_activity = Activity(
                 type=ActivityTypes.message,
                 text=self._answer_preview(result.answer_text),
@@ -172,10 +180,19 @@ class GraydazeTrainingBot(TeamsActivityHandler):
                         request.request_id,
                         result.answer_text,
                         sources=self._build_source_links(getattr(result, "citations", ())),
+                        concepts=concepts,
                     )
                 ],
             )
             await turn_context.send_activity(answer_activity)
+            self._fire_analytics(
+                self._analytics.record_query(
+                    request_id=request.request_id,
+                    user_id=request.identity.user_id,
+                    user_name=request.identity.user_name,
+                    concepts=concepts,
+                )
+            )
         except WikiIntegrationError as exc:
             LOGGER.exception("Wiki integration failure", exc_info=exc)
             await turn_context.send_activity(
@@ -257,7 +274,9 @@ class GraydazeTrainingBot(TeamsActivityHandler):
             "training materials right inside Teams.\n\n"
             "Try asking:\n"
             f"- {self._settings.welcome_examples[0]}\n"
-            f"- {self._settings.welcome_examples[1]}"
+            f"- {self._settings.welcome_examples[1]}\n\n"
+            "_Privacy note: to improve the training program, we log which topics are asked "
+            "about and any feedback you submit — never the text of your questions or answers._"
         )
         await turn_context.send_activity(welcome_text)
         await self._welcome_accessor.set(turn_context, True)
@@ -268,31 +287,65 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         value = turn_context.activity.value or {}
         feedback = str(value.get("feedback", "unknown")).strip().lower()
         request_id = str(value.get("request_id", "unknown")).strip()
-        await self._feedback_logger.log(
-            FeedbackEvent(
-                request_id=request_id,
-                feedback=feedback,
-                user_id=(
-                    turn_context.activity.from_property.id
-                    if turn_context.activity.from_property
-                    else None
-                ),
-                user_name=(
-                    turn_context.activity.from_property.name
-                    if turn_context.activity.from_property
-                    else None
-                ),
-                conversation_id=(
-                    turn_context.activity.conversation.id
-                    if turn_context.activity.conversation
-                    else None
-                ),
-                tenant_id=self._extract_tenant_id(turn_context.activity.channel_data),
-                channel_id=turn_context.activity.channel_id,
+        # `comment` comes from the card's Input.Text; `concepts` rides in the
+        # Action.Submit data. Both default safely for cards sent before this
+        # feature existed (they linger in chat history indefinitely).
+        comment = str(value.get("comment") or "").strip()[:1000]
+        raw_concepts = value.get("concepts")
+        concepts = (
+            tuple(str(item).strip() for item in raw_concepts if str(item).strip())
+            if isinstance(raw_concepts, list)
+            else ()
+        )
+        event = FeedbackEvent(
+            request_id=request_id,
+            feedback=feedback,
+            user_id=(
+                turn_context.activity.from_property.id
+                if turn_context.activity.from_property
+                else None
+            ),
+            user_name=(
+                turn_context.activity.from_property.name
+                if turn_context.activity.from_property
+                else None
+            ),
+            conversation_id=(
+                turn_context.activity.conversation.id
+                if turn_context.activity.conversation
+                else None
+            ),
+            tenant_id=self._extract_tenant_id(turn_context.activity.channel_data),
+            channel_id=turn_context.activity.channel_id,
+            comment=comment,
+            concepts=concepts,
+        )
+        await self._feedback_logger.log(event)
+        self._fire_analytics(
+            self._analytics.record_feedback(
+                request_id=event.request_id,
+                user_id=event.user_id,
+                user_name=event.user_name,
+                rating=event.feedback,
+                comment=event.comment,
+                concepts=event.concepts,
             )
         )
 
         await turn_context.send_activity("Thanks for the feedback.")
+
+    def _fire_analytics(self, coro: Any) -> None:
+        """Run an analytics coroutine in the background, never blocking a reply."""
+
+        task = asyncio.create_task(coro)
+        self._analytics_tasks.add(task)
+
+        def _done(finished: asyncio.Task) -> None:
+            self._analytics_tasks.discard(finished)
+            if not finished.cancelled() and finished.exception() is not None:
+                LOGGER.warning("Analytics task failed", exc_info=finished.exception())
+
+        task.add_done_callback(_done)
 
     async def _handle_sync_command(self, turn_context: TurnContext) -> None:
         """Trigger a manual SharePoint sync instead of querying the RAG pipeline."""

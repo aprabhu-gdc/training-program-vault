@@ -189,6 +189,7 @@ class QueryService:
                 path=str(chunk.metadata.get("path", "")),
                 section=str(chunk.metadata.get("section", "Overview")),
                 sources=tuple(parse_sources_metadata(chunk.metadata.get("sources"))),
+                page_type=str(chunk.metadata.get("type", "unknown")),
             )
             for chunk in chunks
         )

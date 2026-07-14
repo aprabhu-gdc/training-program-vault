@@ -288,6 +288,7 @@ class HttpWikiQueryService:
                     path=str(item.get("path") or ""),
                     section=(str(item.get("section")) if item.get("section") is not None else None),
                     sources=tuple(str(source) for source in list(item.get("sources") or [])),
+                    page_type=(str(item.get("page_type")) if item.get("page_type") is not None else None),
                 )
                 for item in list(raw_result.get("citations") or [])
                 if isinstance(item, Mapping)
