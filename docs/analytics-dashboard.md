@@ -126,10 +126,41 @@ already event-driven.
 Tip: pin a link to the `raw/sources` folder on the dashboard page so
 dashboard users can jump straight to the upload location.
 
-## Data handling
+## Data handling: scoping who can see the analytics
 
 These lists contain user-attributed activity (names + topics + feedback text).
-They live on the team SharePoint site — scope list permissions to the people
-who need the dashboard, and apply your normal retention practices. Keeping
-question/answer text out of the store is enforced in code; keep it that way
-when extending the pipeline.
+By default they inherit the team site's permissions, so **every site member
+could browse them**. To scope access to dashboard users only:
+
+1. **Create a security group** in Entra (e.g. `Training Dashboard Users`)
+   containing the people who need the dashboard. The group is the ongoing
+   control: adding/removing a member grants/revokes access everywhere it's
+   used. A dynamic membership rule (e.g. by job title or department) makes
+   this fully automatic.
+2. **Break inheritance on each list** and grant that group (plus the account
+   Power BI uses for scheduled refresh) Read access. In the SharePoint UI:
+   list ⚙️ **Settings → Permissions for this list → Stop Inheriting
+   Permissions**, remove the site members entry, then **Grant Permissions →**
+   the security group with *Read*. Or as a one-time PnP PowerShell script:
+
+   ```powershell
+   Connect-PnPOnline -Url https://<tenant>.sharepoint.com/sites/<site> -Interactive
+   foreach ($list in 'TrainingBotQueryEvents', 'TrainingBotFeedback') {
+       Set-PnPList -Identity $list -BreakRoleInheritance -CopyRoleAssignments:$false
+       # Entra group claims format: c:0t.c|tenant|<group object id>
+       Set-PnPListPermission -Identity $list -User 'c:0t.c|tenant|<group-object-id>' -AddRole 'Read'
+   }
+   ```
+
+3. **Scope the Power BI side too — this is the one that actually gates
+   dashboard viewers.** Once the report is published, viewers read data from
+   the *dataset*, not from SharePoint, so SharePoint permissions no longer
+   apply to them. Share the workspace/app with the same security group and no
+   one else, and don't grant dataset Build permission beyond report authors.
+
+The bot's own writes are unaffected by any of this: it writes app-only via
+`Sites.Selected`, which bypasses list-level user permissions.
+
+Apply your normal retention practices to both lists. Keeping question/answer
+text out of the store is enforced in code; keep it that way when extending
+the pipeline.
