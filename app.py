@@ -30,6 +30,7 @@ from botbuilder.schema import Activity
 
 from teams_bot.bot import GraydazeTrainingBot
 from teams_bot.config import Settings
+from teams_bot.services.analytics import AnalyticsService
 from teams_bot.services.feedback import FeedbackLogger
 from teams_bot.services.ingest_admin_client import HttpIngestAdminClient
 from teams_bot.services.wiki_query import HttpWikiQueryService, WikiQueryService
@@ -88,6 +89,9 @@ def create_app() -> web.Application:
         base_url=settings.ingest_admin_http_url,
         timeout_seconds=settings.wiki_query_timeout_seconds,
     )
+    # SharePoint-list analytics sink (concept + feedback events for Power BI).
+    # Lazy and fail-soft: if SharePoint is unconfigured it disables itself.
+    analytics = AnalyticsService()
 
     bot = GraydazeTrainingBot(
         settings=settings,
@@ -96,6 +100,7 @@ def create_app() -> web.Application:
         wiki_query_service=wiki_query_service,
         feedback_logger=feedback_logger,
         ingest_admin_client=ingest_admin_client,
+        analytics=analytics,
     )
 
     # CloudAdapter + ConfigurationBotFrameworkAuthentication supports both

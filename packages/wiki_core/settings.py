@@ -95,6 +95,11 @@ class CoreSettings:
     sharepoint_request_timeout_seconds: float
     sharepoint_webhook_notification_url: str
     sharepoint_webhook_client_state: str
+    # Analytics (SharePoint-list sinks read by the Power BI dashboard). Defaulted so
+    # existing construction sites (tests, callers) keep working unchanged.
+    analytics_enabled: bool = True
+    analytics_query_list_name: str = "TrainingBotQueryEvents"
+    analytics_feedback_list_name: str = "TrainingBotFeedback"
 
     @classmethod
     def from_env(cls) -> "CoreSettings":
@@ -176,6 +181,14 @@ class CoreSettings:
             ),
             sharepoint_webhook_notification_url=_read_env("SHAREPOINT_WEBHOOK_NOTIFICATION_URL"),
             sharepoint_webhook_client_state=_read_env("SHAREPOINT_WEBHOOK_CLIENT_STATE"),
+            analytics_enabled=_read_env("ANALYTICS_ENABLED", default="true").strip().lower()
+            not in {"false", "0", "no", "off"},
+            analytics_query_list_name=_read_env(
+                "ANALYTICS_QUERY_LIST_NAME", default="TrainingBotQueryEvents"
+            ),
+            analytics_feedback_list_name=_read_env(
+                "ANALYTICS_FEEDBACK_LIST_NAME", default="TrainingBotFeedback"
+            ),
         )
 
     @property

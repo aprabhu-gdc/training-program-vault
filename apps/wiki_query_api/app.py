@@ -97,6 +97,7 @@ def create_app() -> web.Application:
                         "path": citation.path,
                         "section": citation.section,
                         "sources": list(citation.sources),
+                        "page_type": citation.page_type,
                     }
                     for citation in result.citations
                 ],

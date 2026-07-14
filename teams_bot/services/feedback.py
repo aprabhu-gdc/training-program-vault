@@ -25,6 +25,8 @@ class FeedbackEvent:
     conversation_id: str | None
     tenant_id: str | None
     channel_id: str | None
+    comment: str = ""
+    concepts: tuple[str, ...] = ()
 
 
 class FeedbackLogger:
@@ -41,8 +43,10 @@ class FeedbackLogger:
         logs that are easy to scrape in cloud logging systems.
         """
 
+        # Log the comment's length rather than its content: free-text feedback is
+        # user-authored and belongs in the analytics store, not plaintext app logs.
         LOGGER.info(
-            "feedback request_id=%s feedback=%s user_id=%s user_name=%s conversation_id=%s tenant_id=%s channel_id=%s",
+            "feedback request_id=%s feedback=%s user_id=%s user_name=%s conversation_id=%s tenant_id=%s channel_id=%s comment_chars=%d concepts=%s",
             event.request_id,
             event.feedback,
             event.user_id,
@@ -50,4 +54,6 @@ class FeedbackLogger:
             event.conversation_id,
             event.tenant_id,
             event.channel_id,
+            len(event.comment),
+            list(event.concepts),
         )
