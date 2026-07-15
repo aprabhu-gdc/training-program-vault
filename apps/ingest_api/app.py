@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import uuid
@@ -12,6 +14,7 @@ from packages.contracts.sync import SourceFileEvent, SyncJobAccepted, SyncJobMes
 from packages.shared.documents.extract_text import SUPPORTED_EXTENSIONS
 from packages.shared.messaging.service_bus import send_json_message
 from packages.wiki_core.ingest.sharepoint_adapter import SharePointSourceSyncAdapter
+from packages.wiki_core.ingest.subscription_manager import SubscriptionManager
 from packages.wiki_core.settings import CoreSettings
 
 from .config import IngestQueueSettings
@@ -20,6 +23,9 @@ from packages.shared.logging import configure_logging
 
 configure_logging()
 LOGGER = logging.getLogger(__name__)
+
+# How often the webhook subscription is checked (created/renewed as needed).
+SUBSCRIPTION_CHECK_INTERVAL_SECONDS = 3600.0
 
 
 def _queue_job(settings: IngestQueueSettings, job: SyncJobMessage) -> SyncJobAccepted:
@@ -124,11 +130,30 @@ def create_app() -> web.Application:
         # Graph requires a 2xx within 10 seconds; the actual ingest happens in the worker.
         return web.Response(status=202)
 
+    subscription_manager = SubscriptionManager(_get_adapter, core_settings)
+
+    async def _subscription_loop(app: web.Application):
+        """Background task keeping the Graph webhook subscription alive."""
+
+        async def _cycle() -> None:
+            while True:
+                # ensure_once is sync (httpx) and never raises; run it off-loop.
+                await asyncio.to_thread(subscription_manager.ensure_once)
+                await asyncio.sleep(SUBSCRIPTION_CHECK_INTERVAL_SECONDS)
+
+        task = asyncio.create_task(_cycle())
+        yield
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
     app = web.Application()
     app.router.add_get("/healthz", healthcheck)
     app.router.add_post("/admin/sync", manual_sync)
     app.router.add_post("/api/webhooks/sharepoint", sharepoint_webhook)
+    app.cleanup_ctx.append(_subscription_loop)
     app["settings"] = settings
+    app["subscription_manager"] = subscription_manager
     return app
 
 

@@ -146,6 +146,27 @@ class SharePointSourceSyncAdapter:
             raise ValueError("Microsoft Graph subscription renewal returned an unexpected payload.")
         return payload
 
+    def list_subscriptions(self) -> list[dict[str, Any]]:
+        """Return every Graph subscription visible to this app registration."""
+
+        subscriptions: list[dict[str, Any]] = []
+        url: str | None = f"{self.GRAPH_BASE_URL}/subscriptions"
+        with httpx.Client(timeout=self._timeout, headers=self._authorized_headers()) as client:
+            while url:
+                response = client.get(url)
+                response.raise_for_status()
+                payload = response.json()
+                for item in list(payload.get("value") or []):
+                    if isinstance(item, dict):
+                        subscriptions.append(item)
+                url = str(payload.get("@odata.nextLink") or "") or None
+        return subscriptions
+
+    def subscription_resource(self) -> str:
+        """The Graph resource path our drive change subscription targets."""
+
+        return f"/drives/{self._drive_id()}/root"
+
     def delete_subscription(self, subscription_id: str) -> None:
         if not subscription_id:
             return

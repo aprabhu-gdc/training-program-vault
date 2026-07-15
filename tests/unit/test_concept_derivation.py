@@ -60,3 +60,61 @@ def test_path_prefix_fallback_for_index_rows_without_page_type():
 def test_untitled_concept_gets_placeholder_title():
     citation = Citation(title="  ", path="wiki/concepts/x.md", page_type="concept")
     assert derive_concepts((citation,)) == ("Untitled",)
+
+
+# --- source->concept mapping (the inverse index) ---
+
+
+SOURCE_MAP = {
+    "wiki/sources/etc-training.md": ("Estimate to Complete",),
+    "wiki/sources/pm-101-crd.md": ("Estimate to Complete", "Graydaze Project Manager Role"),
+    "wiki/sources/ramp-guide.md": ("Ramp Credit Card Coding",),
+}
+
+
+def test_source_citation_maps_to_citing_concept():
+    citations = (_source("etc-training"),)
+    assert derive_concepts(citations, SOURCE_MAP) == ("Estimate to Complete",)
+
+
+def test_source_cited_by_two_concepts_yields_both():
+    citations = (_source("pm-101-crd"),)
+    assert derive_concepts(citations, SOURCE_MAP) == (
+        "Estimate to Complete",
+        "Graydaze Project Manager Role",
+    )
+
+
+def test_mixed_citations_preserve_retrieval_rank_and_dedupe_by_title():
+    citations = (
+        _source("etc-training"),          # -> Estimate to Complete
+        _concept("Mission Support"),      # direct concept
+        _source("pm-101-crd"),            # -> Estimate to Complete (dup) + PM Role
+    )
+    assert derive_concepts(citations, SOURCE_MAP) == (
+        "Estimate to Complete",
+        "Mission Support",
+        "Graydaze Project Manager Role",
+    )
+
+
+def test_cap_applies_across_mapped_titles():
+    citations = (
+        _source("pm-101-crd"),   # two titles
+        _source("ramp-guide"),   # third title reaches the cap
+        _concept("Mission Support"),  # beyond cap, dropped
+    )
+    result = derive_concepts(citations, SOURCE_MAP)
+    assert len(result) == 3
+    assert "Mission Support" not in result
+
+
+def test_unmapped_source_still_yields_unknown():
+    citations = (_source("uncited-source"),)
+    assert derive_concepts(citations, SOURCE_MAP) == ("Unknown",)
+
+
+def test_no_map_keeps_legacy_behavior():
+    citations = (_source("etc-training"),)
+    assert derive_concepts(citations) == ("Unknown",)
+    assert derive_concepts(citations, None) == ("Unknown",)

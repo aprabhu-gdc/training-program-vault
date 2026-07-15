@@ -113,15 +113,35 @@ def _poll_once(settings: WorkerSettings, service: AutoIngestService) -> int:
         return 0
 
 
+def _run_reconcile(service: AutoIngestService) -> None:
+    """Periodic full sync: heals content missed by webhook notifications.
+
+    Cheap in the common case — unchanged files are skipped via the per-file
+    fingerprint state. Never raises; a failed sweep retries next interval.
+    """
+
+    LOGGER.info("Running scheduled reconciliation sync")
+    try:
+        service.sync_all_training_files()
+    except Exception:
+        LOGGER.exception("Reconciliation sync failed; retrying next interval")
+
+
 def main() -> int:
     configure_logging()
     settings = WorkerSettings.from_env()
     settings.validate_queue()
     service = AutoIngestService(settings.backend)
 
+    reconcile_seconds = max(settings.reconcile_hours, 0.0) * 3600.0
+    next_reconcile = time.monotonic() + reconcile_seconds if reconcile_seconds else None
+
     while True:
         if _poll_once(settings, service) == 0:
             time.sleep(2)
+        if next_reconcile is not None and time.monotonic() >= next_reconcile:
+            _run_reconcile(service)
+            next_reconcile = time.monotonic() + reconcile_seconds
 
 
 if __name__ == "__main__":
