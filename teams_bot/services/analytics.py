@@ -27,21 +27,35 @@ MAX_CONCEPTS_PER_QUERY = 3
 # an ingest sync runs, so brief staleness is acceptable.
 CONCEPT_MAP_TTL_SECONDS = 900.0
 
+# Fallback acceptance margin: a concept candidate from the type-filtered
+# retrieval pass counts only when its distance is within this much of the best
+# overall hit. Keeps genuinely off-topic queries classified as Unknown while
+# accepting concepts that were merely crowded out of the main top_k by the far
+# more numerous source pages.
+CONCEPT_DISTANCE_MARGIN = 0.15
+
 
 def derive_concepts(
     citations: Iterable[Any],
     source_concepts: Mapping[str, tuple[str, ...]] | None = None,
+    concept_candidates: Iterable[Mapping[str, Any]] | None = None,
+    top_distance: float | None = None,
 ) -> tuple[str, ...]:
     """Map rank-ordered citations to the concept titles the query was about.
 
-    A citation counts directly as a concept when its ``page_type`` is
-    ``concept`` (or, for index rows built before ``page_type`` existed, its
-    path is under ``wiki/concepts/``). Retrieval is dominated by ``source``
-    pages, so source citations are mapped back to the concepts that cite them
-    via ``source_concepts`` (source wiki path -> concept titles, built by
-    ``ConceptMapResolver``). Keeps retrieval rank order, dedupes by title
-    (the analytics column is title-keyed), caps at ``MAX_CONCEPTS_PER_QUERY``.
-    No concept match (including answers with no citations) yields
+    Three passes, most precise first:
+    1. A citation whose ``page_type`` is ``concept`` (or whose path is under
+       ``wiki/concepts/``) counts as itself.
+    2. A source citation maps to the concepts citing it via ``source_concepts``
+       (built by ``ConceptMapResolver`` from concept frontmatter).
+    3. If nothing matched, fall back to ``concept_candidates`` — the nearest
+       concept-typed chunks from retrieval diagnostics — accepting only those
+       within ``CONCEPT_DISTANCE_MARGIN`` of ``top_distance`` (the best overall
+       hit). This covers concept pages crowded out of the main top_k and source
+       pages the (often stale) concept frontmatter never cited.
+
+    Keeps retrieval rank order, dedupes by title (the analytics column is
+    title-keyed), caps at ``MAX_CONCEPTS_PER_QUERY``. No match yields
     ``("Unknown",)``.
     """
 
@@ -67,6 +81,16 @@ def derive_concepts(
             continue
         for concept_title in (source_concepts or {}).get(path, ()):
             if _add(concept_title):
+                break
+
+    if not concepts and concept_candidates and top_distance is not None:
+        for candidate in concept_candidates:
+            distance = candidate.get("distance")
+            if not isinstance(distance, (int, float)):
+                continue
+            if distance > top_distance + CONCEPT_DISTANCE_MARGIN:
+                continue
+            if _add(str(candidate.get("title") or "")):
                 break
 
     return tuple(concepts) if concepts else (UNKNOWN_CONCEPT,)
@@ -101,8 +125,13 @@ class ConceptMapResolver:
             return self._mapping
         try:
             self._mapping = self._build()
-            if self._warned:
-                LOGGER.info("Source->concept map recovered with %d source entries", len(self._mapping))
+            if not self._mapping:
+                LOGGER.warning(
+                    "Source->concept map built EMPTY (no concept pages with wiki/ sources found "
+                    "under the configured wiki root) — source citations will classify as Unknown"
+                )
+            else:
+                LOGGER.info("Source->concept map built with %d source entries", len(self._mapping))
             self._warned = False
         except Exception:
             if not self._warned:

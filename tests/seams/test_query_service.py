@@ -21,16 +21,32 @@ ROW = {
 }
 
 
+CONCEPT_ROW = {
+    "id": "chunk-2",
+    "title": "My Concept",
+    "section": "Current Synthesis",
+    "path": "wiki/concepts/my-concept.md",
+    "sources": '["wiki/sources/x.md"]',
+    "type": "concept",
+    "text": "Synthesized concept content.",
+    "_distance": 1.05,
+}
+
+
 class FakeVectorStore:
     def __init__(self, rows, ready=True):
         self._rows = rows
         self._ready = ready
+        self.filter_calls = []
 
     def is_ready(self):
         return self._ready
 
     def search(self, embedding, *, top_k, filters=None):
         self.last_top_k = top_k
+        if filters:
+            self.filter_calls.append(filters)
+            return [row for row in self._rows if all(row.get(k) == v for k, v in filters.items())]
         return self._rows
 
 
@@ -83,6 +99,18 @@ async def test_query_returns_answer_and_citations(core_settings):
     assert citation.page_type == "source"
     assert resp.retrieval_diagnostics["top_k"] == core_settings.rag_top_k
     assert resp.retrieval_diagnostics["chunk_ids"] == ["chunk-1"]
+    assert resp.retrieval_diagnostics["top_distance"] == 0.12
+
+
+async def test_query_diagnostics_include_concept_candidates(core_settings):
+    service = _service(core_settings, [ROW, CONCEPT_ROW])
+    resp = await service.query(_request())
+
+    assert service._vector_store.filter_calls == [{"type": "concept"}]
+    candidates = resp.retrieval_diagnostics["concept_candidates"]
+    assert candidates == [
+        {"title": "My Concept", "path": "wiki/concepts/my-concept.md", "distance": 1.05}
+    ]
 
 
 async def test_query_passes_retrieved_context_into_prompt(core_settings):

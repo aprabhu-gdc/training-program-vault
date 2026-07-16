@@ -176,7 +176,13 @@ class GraydazeTrainingBot(TeamsActivityHandler):
             # The map build reads the whole wiki on a cold/expired cache, so it
             # runs off the event loop. mapping() is fail-soft and never raises.
             source_concepts = await asyncio.to_thread(self._concept_map.mapping)
-            concepts = derive_concepts(getattr(result, "citations", ()), source_concepts)
+            diagnostics = getattr(result, "retrieval_diagnostics", None) or {}
+            concepts = derive_concepts(
+                getattr(result, "citations", ()),
+                source_concepts,
+                concept_candidates=diagnostics.get("concept_candidates"),
+                top_distance=diagnostics.get("top_distance"),
+            )
             answer_activity = Activity(
                 type=ActivityTypes.message,
                 text=self._answer_preview(result.answer_text),
