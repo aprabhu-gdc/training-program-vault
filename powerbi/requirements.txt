@@ -1,0 +1,5 @@
+fabric-cicd==1.2.0
+azure-identity>=1.17
+requests>=2.31
+jsonschema>=4.21
+referencing>=0.35

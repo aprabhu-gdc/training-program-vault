@@ -1,0 +1,5 @@
+expression SharePointSiteUrl = "https://graydazeb.sharepoint.com" meta [IsParameterQuery=true, Type="Text", IsParameterQueryRequired=true]
+	lineageTag: 84d75fa3-f2eb-4959-a32d-abca9d0ad040
+
+	annotation PBI_ResultType = Text
+

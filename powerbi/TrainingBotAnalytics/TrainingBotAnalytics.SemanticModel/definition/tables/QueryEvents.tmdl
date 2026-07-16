@@ -1,0 +1,78 @@
+table QueryEvents
+	lineageTag: acde9cbb-6ea2-42e9-8014-39274c1cd46f
+
+	column Timestamp
+		dataType: dateTime
+		formatString: General Date
+		lineageTag: d9e0f069-8f43-44b0-a06c-6cadf4d6171e
+		summarizeBy: none
+		sourceColumn: Timestamp
+
+		annotation SummarizationSetBy = Automatic
+
+	column Date
+		dataType: dateTime
+		formatString: Short Date
+		lineageTag: e45a4ccc-58ad-4dac-9961-a7ef687b9682
+		summarizeBy: none
+		sourceColumn: Date
+
+		annotation SummarizationSetBy = Automatic
+
+		annotation UnderlyingDateTimeDataType = Date
+
+	column RequestId
+		dataType: string
+		lineageTag: e6fba6d5-fbbb-4825-b246-98866069a146
+		summarizeBy: none
+		sourceColumn: RequestId
+
+		annotation SummarizationSetBy = Automatic
+
+	column UserId
+		dataType: string
+		lineageTag: a932defb-346c-41a0-b927-c8b656b4e6ec
+		summarizeBy: none
+		sourceColumn: UserId
+
+		annotation SummarizationSetBy = Automatic
+
+	column UserName
+		dataType: string
+		lineageTag: 78a6c8d9-1c8b-42a5-8364-77f4e2f665ad
+		summarizeBy: none
+		sourceColumn: UserName
+
+		annotation SummarizationSetBy = Automatic
+
+	column Concept
+		dataType: string
+		lineageTag: f9a4ad7f-1fb2-465b-b300-874d70a8f281
+		summarizeBy: none
+		sourceColumn: Concept
+
+		annotation SummarizationSetBy = Automatic
+
+	column IsUnknown
+		dataType: boolean
+		formatString: """TRUE"";""TRUE"";""FALSE"""
+		lineageTag: b40a0e38-4504-4b8e-9139-d84669b5b036
+		summarizeBy: none
+		sourceColumn: IsUnknown
+
+		annotation SummarizationSetBy = Automatic
+
+	partition QueryEvents = m
+		mode: import
+		source =
+				let
+				    Source = SharePoint.Tables(SharePointSiteUrl, [Implementation = "2.0", ViewMode = "All"]),
+				    List = Source{[Title = "TrainingBotQueryEvents"]}[Items],
+				    Selected = Table.SelectColumns(List, {"Timestamp", "RequestId", "UserId", "UserName", "Concept", "IsUnknown"}),
+				    Typed = Table.TransformColumnTypes(Selected, {{"Timestamp", type datetime}, {"RequestId", type text}, {"UserId", type text}, {"UserName", type text}, {"Concept", type text}, {"IsUnknown", type logical}}),
+				    WithDate = Table.AddColumn(Typed, "Date", each Date.From([Timestamp]), type date)
+				in
+				    WithDate
+
+	annotation PBI_ResultType = Table
+

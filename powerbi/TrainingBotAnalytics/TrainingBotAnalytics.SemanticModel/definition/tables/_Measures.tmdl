@@ -1,0 +1,51 @@
+table _Measures
+	lineageTag: f27d05f4-6bd8-4694-ab25-344a6d8bc329
+
+	measure 'Questions Asked' = DISTINCTCOUNT ( QueryEvents[RequestId] )
+		formatString: #,0
+		lineageTag: f758d251-53c2-4b00-a101-5885c16e19ed
+
+	measure 'Unknown Questions' = CALCULATE ( [Questions Asked], QueryEvents[IsUnknown] = TRUE () )
+		formatString: #,0
+		lineageTag: 623eb2e0-2245-4359-b391-0ce10fd840a8
+
+	measure 'Known Concept Rows' = CALCULATE ( COUNTROWS ( QueryEvents ), QueryEvents[IsUnknown] = FALSE () )
+		formatString: #,0
+		lineageTag: b18f36c7-3397-444c-8b33-f3a9732be0d8
+
+	measure 'Feedback Count' = COUNTROWS ( Feedback )
+		formatString: #,0
+		lineageTag: 444a82e9-3cd4-45c2-9020-4aa93499e4fb
+
+	measure 'Helpful Count' = CALCULATE ( COUNTROWS ( Feedback ), Feedback[Rating] = "helpful" )
+		formatString: #,0
+		lineageTag: 7ff0b821-74af-4ba8-9e15-861f30035563
+
+	measure 'Inaccurate Count' = CALCULATE ( COUNTROWS ( Feedback ), Feedback[Rating] = "inaccurate" )
+		formatString: #,0
+		lineageTag: 03aedf2c-133d-4512-a614-32a669de38a4
+
+	measure 'Helpful %' = DIVIDE ( [Helpful Count], [Feedback Count] )
+		formatString: 0.0%
+		lineageTag: 2600b83d-2e7a-4716-9a29-81e565ccd24a
+
+	column Value
+		dataType: int64
+		isHidden
+		formatString: 0
+		lineageTag: 4e6f5cf7-f76c-4105-87a3-86d09581936c
+		summarizeBy: none
+		sourceColumn: Value
+
+		annotation SummarizationSetBy = Automatic
+
+	partition _Measures = m
+		mode: import
+		source =
+				let
+				    Source = #table(type table [Value = Int64.Type], {})
+				in
+				    Source
+
+	annotation PBI_ResultType = Table
+

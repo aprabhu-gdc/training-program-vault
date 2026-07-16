@@ -1,0 +1,21 @@
+table DimDate
+	lineageTag: d61700f6-a83f-4c2e-a432-91f19b86fba9
+	dataCategory: Time
+
+	column Date
+		dataType: dateTime
+		isKey
+		formatString: Short Date
+		lineageTag: f0c2edb6-8162-4430-bbc4-a3221efbff9d
+		summarizeBy: none
+		isNameInferred
+		sourceColumn: [Date]
+
+		annotation SummarizationSetBy = Automatic
+
+	partition DimDate = calculated
+		mode: import
+		source = CALENDARAUTO ()
+
+	annotation PBI_ResultType = Table
+

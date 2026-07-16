@@ -1,0 +1,16 @@
+relationship 47f0a356-9f49-485a-9199-07c6c035428e
+	fromColumn: QueryEvents.UserName
+	toColumn: DimUser.UserName
+
+relationship 7cc28e40-e032-4159-8b3e-42d15af2ab9b
+	fromColumn: Feedback.UserName
+	toColumn: DimUser.UserName
+
+relationship 3c409ed5-b1e4-4c62-95e1-3bd77a2e2738
+	fromColumn: QueryEvents.Date
+	toColumn: DimDate.Date
+
+relationship 6be37134-00a3-4ca1-8b1c-e04e8bcd70a4
+	fromColumn: Feedback.Date
+	toColumn: DimDate.Date
+
