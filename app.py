@@ -11,9 +11,11 @@ existing wiki query function through a configurable import path.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
+import aiohttp
 from aiohttp import web
 from botbuilder.core import (
     ConversationState,
@@ -42,6 +44,51 @@ from packages.shared.logging import configure_logging
 # Azure SDK noise suppression, consistent across the bot, ingest API, and worker).
 configure_logging()
 LOGGER = logging.getLogger(__name__)
+
+
+# Microsoft Graph delivers webhook notifications to the public bot port and
+# expects a response within 10 seconds; the upstream ingest handler answers
+# instantly (validation echo or enqueue), so an 8s budget leaves headroom to
+# still return a real 502 when the ingest API is down.
+WEBHOOK_PROXY_TIMEOUT_SECONDS = 8.0
+MAX_WEBHOOK_BODY_BYTES = 1024 * 1024
+
+
+def make_sharepoint_webhook_proxy(target_base_url: str):
+    """Build a handler that forwards Graph webhook POSTs to the ingest API.
+
+    The ingest API owns the SharePoint webhook logic (validation-token echo,
+    clientState check, queueing) but listens on a private localhost port; only
+    the bot's port is exposed by App Service. This proxy forwards the request
+    verbatim — raw query string (carries ``validationToken``), body, and
+    Content-Type — and returns the upstream status/body unchanged. Bodies are
+    never logged: notification payloads carry the clientState secret.
+    """
+
+    target_url = target_base_url.rstrip("/") + "/api/webhooks/sharepoint"
+
+    async def proxy(request: web.Request) -> web.Response:
+        body = await request.read()
+        if len(body) > MAX_WEBHOOK_BODY_BYTES:
+            return web.json_response({"error": "Payload too large."}, status=413)
+
+        url = f"{target_url}?{request.query_string}" if request.query_string else target_url
+        headers = {}
+        if request.headers.get("Content-Type"):
+            headers["Content-Type"] = request.headers["Content-Type"]
+
+        timeout = aiohttp.ClientTimeout(total=WEBHOOK_PROXY_TIMEOUT_SECONDS)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, data=body, headers=headers) as upstream:
+                    payload = await upstream.read()
+                    content_type = (upstream.headers.get("Content-Type") or "application/json").split(";")[0]
+                    return web.Response(body=payload, status=upstream.status, content_type=content_type)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            LOGGER.warning("SharePoint webhook proxy could not reach the ingest API at %s", target_url)
+            return web.json_response({"error": "Ingest service unavailable."}, status=502)
+
+    return proxy
 
 
 class _BotAuthConfig:
@@ -182,6 +229,12 @@ def create_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/healthz", healthcheck)
     app.router.add_post("/api/messages", messages)
+    # Graph webhook notifications arrive on the public bot port and are relayed
+    # to the private ingest API, which owns the actual webhook handling.
+    app.router.add_post(
+        "/api/webhooks/sharepoint",
+        make_sharepoint_webhook_proxy(settings.ingest_admin_http_url),
+    )
     app["settings"] = settings
 
     LOGGER.info(

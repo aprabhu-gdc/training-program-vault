@@ -112,14 +112,21 @@ hourly refresh is plenty at this volume.
 ## Adding new training material (ingest)
 
 There is no upload button in the dashboard because none is needed: ingest is
-already event-driven.
+event-driven, with a scheduled sweep as a safety net.
 
-1. Upload the new file (`.docx`, `.pdf`, `.pptx`, `.xlsx`, `.xlsm`) to the
-   **`raw/sources`** folder of the *Training Program Vault* library on the team
-   site. A Microsoft Graph webhook notices the change, queues an ingest job,
-   and the worker regenerates the relevant wiki pages and refreshes the bot's
-   vector index automatically — typically within a few minutes.
-2. Fallback / bulk refresh: type **`/sync`** to the bot in Teams to queue a
+1. Upload the new file to the **`raw/sources`** folder of the *Training
+   Program Vault* library on the team site. **Only `.docx`, `.pdf`, `.pptx`,
+   `.xlsx`, and `.xlsm` files are ingested** — anything else (videos, images,
+   `.txt`/`.md`) is skipped silently. A Microsoft Graph webhook (delivered via
+   the bot's public `/api/webhooks/sharepoint` endpoint and kept alive by an
+   hourly subscription renewer) queues an ingest job, and the worker
+   regenerates the relevant wiki pages and refreshes the bot's vector index —
+   typically within a few minutes. Requires `SHAREPOINT_WEBHOOK_NOTIFICATION_URL`
+   and `SHAREPOINT_WEBHOOK_CLIENT_STATE` app settings.
+2. Even if a notification is missed, the worker runs a **reconciliation sync
+   every 6 hours** (`INGEST_RECONCILE_HOURS`, `0` disables) that picks up any
+   new or changed files.
+3. On-demand / bulk refresh: type **`/sync`** to the bot in Teams to queue a
    full SharePoint re-sync (or run
    `python -m packages.wiki_core.ingest.ingest_service --manual`).
 

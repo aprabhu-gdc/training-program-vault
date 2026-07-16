@@ -24,7 +24,7 @@ from packages.contracts.query import QueryAttachment, QueryRequest
 from packages.shared.documents.extract_text import SUPPORTED_EXTENSIONS, extract_text
 from teams_bot.cards import build_answer_card
 from teams_bot.config import Settings
-from teams_bot.services.analytics import AnalyticsService, derive_concepts
+from teams_bot.services.analytics import AnalyticsService, ConceptMapResolver, derive_concepts
 from teams_bot.services.feedback import FeedbackEvent, FeedbackLogger
 from teams_bot.services.ingest_admin_client import HttpIngestAdminClient
 from teams_bot.services.source_links import SourceLinkResolver
@@ -50,6 +50,7 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         feedback_logger: FeedbackLogger,
         ingest_admin_client: HttpIngestAdminClient,
         analytics: AnalyticsService | None = None,
+        concept_map: ConceptMapResolver | None = None,
     ) -> None:
         super().__init__()
         self._settings = settings
@@ -59,6 +60,7 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         self._feedback_logger = feedback_logger
         self._ingest_admin_client = ingest_admin_client
         self._analytics = analytics or AnalyticsService()
+        self._concept_map = concept_map or ConceptMapResolver()
         # Strong references keep fire-and-forget analytics tasks alive until done.
         self._analytics_tasks: set[asyncio.Task] = set()
         self._source_links = SourceLinkResolver()
@@ -171,7 +173,10 @@ class GraydazeTrainingBot(TeamsActivityHandler):
 
             result = await self._wiki_query_service.query(request)
 
-            concepts = derive_concepts(getattr(result, "citations", ()))
+            # The map build reads the whole wiki on a cold/expired cache, so it
+            # runs off the event loop. mapping() is fail-soft and never raises.
+            source_concepts = await asyncio.to_thread(self._concept_map.mapping)
+            concepts = derive_concepts(getattr(result, "citations", ()), source_concepts)
             answer_activity = Activity(
                 type=ActivityTypes.message,
                 text=self._answer_preview(result.answer_text),

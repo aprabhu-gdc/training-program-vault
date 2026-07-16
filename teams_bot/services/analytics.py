@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import UTC, datetime
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 
 LOGGER = logging.getLogger(__name__)
@@ -22,34 +23,127 @@ LOGGER = logging.getLogger(__name__)
 UNKNOWN_CONCEPT = "Unknown"
 MAX_CONCEPTS_PER_QUERY = 3
 
+# How long a built source->concept map stays fresh. The wiki only changes when
+# an ingest sync runs, so brief staleness is acceptable.
+CONCEPT_MAP_TTL_SECONDS = 900.0
 
-def derive_concepts(citations: Iterable[Any]) -> tuple[str, ...]:
+
+def derive_concepts(
+    citations: Iterable[Any],
+    source_concepts: Mapping[str, tuple[str, ...]] | None = None,
+) -> tuple[str, ...]:
     """Map rank-ordered citations to the concept titles the query was about.
 
-    A citation counts as a concept when its ``page_type`` is ``concept`` (or,
-    for index rows built before ``page_type`` existed, its path is under
-    ``wiki/concepts/``). Source/entity/index chunks are ignored — there is no
-    source-to-concept inverse index today. Dedupes by page, keeps retrieval
-    order, caps at ``MAX_CONCEPTS_PER_QUERY``. No concept match (including
-    answers with no citations at all) yields ``("Unknown",)``.
+    A citation counts directly as a concept when its ``page_type`` is
+    ``concept`` (or, for index rows built before ``page_type`` existed, its
+    path is under ``wiki/concepts/``). Retrieval is dominated by ``source``
+    pages, so source citations are mapped back to the concepts that cite them
+    via ``source_concepts`` (source wiki path -> concept titles, built by
+    ``ConceptMapResolver``). Keeps retrieval rank order, dedupes by title
+    (the analytics column is title-keyed), caps at ``MAX_CONCEPTS_PER_QUERY``.
+    No concept match (including answers with no citations) yields
+    ``("Unknown",)``.
     """
 
     concepts: list[str] = []
     seen: set[str] = set()
+
+    def _add(title: str) -> bool:
+        """Record a concept title; return True once the cap is reached."""
+
+        title = title.strip() or "Untitled"
+        if title not in seen:
+            seen.add(title)
+            concepts.append(title)
+        return len(concepts) >= MAX_CONCEPTS_PER_QUERY
+
     for citation in citations or ():
-        path = str(getattr(citation, "path", "") or "")
-        page_type = str(getattr(citation, "page_type", "") or "")
-        if page_type != "concept" and not path.startswith("wiki/concepts/"):
-            continue
-        title = str(getattr(citation, "title", "") or "").strip() or "Untitled"
-        key = path or title
-        if key in seen:
-            continue
-        seen.add(key)
-        concepts.append(title)
         if len(concepts) >= MAX_CONCEPTS_PER_QUERY:
             break
+        path = str(getattr(citation, "path", "") or "")
+        page_type = str(getattr(citation, "page_type", "") or "")
+        if page_type == "concept" or path.startswith("wiki/concepts/"):
+            _add(str(getattr(citation, "title", "") or ""))
+            continue
+        for concept_title in (source_concepts or {}).get(path, ()):
+            if _add(concept_title):
+                break
+
     return tuple(concepts) if concepts else (UNKNOWN_CONCEPT,)
+
+
+class ConceptMapResolver:
+    """Builds and caches the inverse map {source wiki path -> concept titles}.
+
+    Concept pages' frontmatter ``sources:`` lists the ``wiki/sources/*.md``
+    pages they cite, which exactly match source citations' ``path``. This
+    inverts that relationship so retrieved source chunks can be attributed to
+    concepts. Fail-soft like ``SourceLinkResolver``: a failed build keeps the
+    last good map (initially empty) and retries after the TTL — analytics
+    degrades to Unknown-heavy classification, answers are never affected.
+    """
+
+    def __init__(self, settings: Any = None, ttl_seconds: float = CONCEPT_MAP_TTL_SECONDS) -> None:
+        self._settings = settings
+        self._ttl_seconds = ttl_seconds
+        self._mapping: dict[str, tuple[str, ...]] = {}
+        self._expires_at = 0.0
+        self._warned = False
+
+    def mapping(self) -> Mapping[str, tuple[str, ...]]:
+        """Return the current map, rebuilding when the TTL has lapsed.
+
+        Synchronous (a cold build reads every wiki page); call via
+        ``asyncio.to_thread`` from async code. Never raises.
+        """
+
+        if time.monotonic() < self._expires_at:
+            return self._mapping
+        try:
+            self._mapping = self._build()
+            if self._warned:
+                LOGGER.info("Source->concept map recovered with %d source entries", len(self._mapping))
+            self._warned = False
+        except Exception:
+            if not self._warned:
+                LOGGER.warning(
+                    "Could not build the source->concept map; keeping the previous mapping",
+                    exc_info=True,
+                )
+                self._warned = True
+        self._expires_at = time.monotonic() + self._ttl_seconds
+        return self._mapping
+
+    def _build(self) -> dict[str, tuple[str, ...]]:
+        # Imported lazily so the bot has no hard dependency on wiki-core
+        # configuration at import time (same posture as SourceLinkResolver).
+        from packages.wiki_core.content.file_page_store import FilePageStore
+        from packages.wiki_core.settings import CoreSettings
+
+        if self._settings is None:
+            self._settings = CoreSettings.from_env()
+        store = FilePageStore(self._settings)
+
+        mapping: dict[str, list[str]] = {}
+        for path in store.iter_wiki_pages():
+            try:
+                page = store.load_wiki_page(path)
+            except Exception:
+                LOGGER.debug("Skipping unreadable wiki page %s", path, exc_info=True)
+                continue
+            if page.page_type != "concept":
+                continue
+            title = page.title.strip() or "Untitled"
+            for source in page.sources:
+                normalized = str(source).strip().strip("/")
+                # Concept frontmatter can also reference raw/ files; only wiki
+                # pages appear as citation paths.
+                if not normalized.startswith("wiki/"):
+                    continue
+                titles = mapping.setdefault(normalized, [])
+                if title not in titles:
+                    titles.append(title)
+        return {source: tuple(titles) for source, titles in mapping.items()}
 
 
 def _utc_timestamp() -> str:

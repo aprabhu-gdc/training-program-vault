@@ -334,8 +334,14 @@ Service Bus settings):
 
 Provisioning runbook (Entra app → Azure Bot resource → App Service → sideload) and
 the values to capture are tracked in the project plan. Near-real-time SharePoint
-sync (public webhook + subscription renewer), durable bot storage, and org-wide
-catalog publishing are deferred to Stage 2; the pilot uses manual `/sync`.
+sync is live: Graph notifications arrive on the bot's public
+`/api/webhooks/sharepoint` route (proxied to the ingest API), the ingest API
+keeps the Graph subscription alive (created on startup, renewed hourly as
+needed), and the worker runs a reconciliation sync every `INGEST_RECONCILE_HOURS`
+(default 6) as a safety net. Requires `SHAREPOINT_WEBHOOK_NOTIFICATION_URL` and
+`SHAREPOINT_WEBHOOK_CLIENT_STATE`; without them the renewer disables itself and
+ingest falls back to manual `/sync` + the scheduled sweep. Durable bot storage
+and org-wide catalog publishing remain deferred to Stage 2.
 
 ## Repository Notes
 

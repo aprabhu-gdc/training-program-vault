@@ -69,6 +69,19 @@ def test_unknown_job_type_raises(tmp_path):
         _process_job({"job_id": "j5", "job_type": "frobnicate"}, service)
 
 
+def test_reconcile_runs_full_sync(tmp_path):
+    service = _fake_service(tmp_path)
+    worker_mod._run_reconcile(service)
+    service.sync_all_training_files.assert_called_once()
+
+
+def test_reconcile_swallows_sync_failure(tmp_path):
+    service = _fake_service(tmp_path)
+    service.sync_all_training_files.side_effect = RuntimeError("sharepoint down")
+    worker_mod._run_reconcile(service)  # must not raise
+    service.sync_all_training_files.assert_called_once()
+
+
 def test_duplicate_job_id_is_idempotent(tmp_path):
     service = _fake_service(tmp_path)
     job = {"job_id": "dup", "job_type": "manual"}
