@@ -1,0 +1,85 @@
+table Feedback
+	lineageTag: c8e13c69-5dea-49dd-964e-a2e206a4c662
+
+	column Timestamp
+		dataType: dateTime
+		formatString: General Date
+		lineageTag: c93fee08-bf92-4b09-94e4-1c13c83ac8d4
+		summarizeBy: none
+		sourceColumn: Timestamp
+
+		annotation SummarizationSetBy = Automatic
+
+	column Date
+		dataType: dateTime
+		formatString: Short Date
+		lineageTag: 462b7110-c678-4444-af42-89e3c950a8c3
+		summarizeBy: none
+		sourceColumn: Date
+
+		annotation SummarizationSetBy = Automatic
+
+		annotation UnderlyingDateTimeDataType = Date
+
+	column RequestId
+		dataType: string
+		lineageTag: 5b2c091c-15e2-416a-a7ef-84b23c4e2b04
+		summarizeBy: none
+		sourceColumn: RequestId
+
+		annotation SummarizationSetBy = Automatic
+
+	column UserId
+		dataType: string
+		lineageTag: 71f09f2b-941a-4539-b06c-73b47b536cb0
+		summarizeBy: none
+		sourceColumn: UserId
+
+		annotation SummarizationSetBy = Automatic
+
+	column UserName
+		dataType: string
+		lineageTag: 594a7b22-0724-4c37-9d3a-15f74fc0551f
+		summarizeBy: none
+		sourceColumn: UserName
+
+		annotation SummarizationSetBy = Automatic
+
+	column Rating
+		dataType: string
+		lineageTag: 45bebc1c-9c1c-43e7-89ff-ac21a9c5e72c
+		summarizeBy: none
+		sourceColumn: Rating
+
+		annotation SummarizationSetBy = Automatic
+
+	column Comment
+		dataType: string
+		lineageTag: 752149db-fca9-4156-b276-9662acfc2e65
+		summarizeBy: none
+		sourceColumn: Comment
+
+		annotation SummarizationSetBy = Automatic
+
+	column Concepts
+		dataType: string
+		lineageTag: c17378e0-26e4-4673-b735-84684a991415
+		summarizeBy: none
+		sourceColumn: Concepts
+
+		annotation SummarizationSetBy = Automatic
+
+	partition Feedback = m
+		mode: import
+		source =
+				let
+				    Source = SharePoint.Tables(SharePointSiteUrl, [Implementation = "2.0", ViewMode = "All"]),
+				    List = Source{[Title = "TrainingBotFeedback"]}[Items],
+				    Selected = Table.SelectColumns(List, {"Timestamp", "RequestId", "UserId", "UserName", "Rating", "Comment", "Concepts"}),
+				    Typed = Table.TransformColumnTypes(Selected, {{"Timestamp", type datetime}, {"RequestId", type text}, {"UserId", type text}, {"UserName", type text}, {"Rating", type text}, {"Comment", type text}, {"Concepts", type text}}),
+				    WithDate = Table.AddColumn(Typed, "Date", each Date.From([Timestamp]), type date)
+				in
+				    WithDate
+
+	annotation PBI_ResultType = Table
+

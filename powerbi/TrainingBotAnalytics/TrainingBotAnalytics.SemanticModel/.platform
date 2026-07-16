@@ -1,0 +1,11 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/platformProperties/2.0.0/schema.json",
+  "metadata": {
+    "type": "SemanticModel",
+    "displayName": "TrainingBotAnalytics"
+  },
+  "config": {
+    "version": "2.0",
+    "logicalId": "7649ee64-0ff1-424d-a15e-8c4b993f7e82"
+  }
+}

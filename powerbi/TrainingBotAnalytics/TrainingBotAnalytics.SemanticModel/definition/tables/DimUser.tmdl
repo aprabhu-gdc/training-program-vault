@@ -1,0 +1,24 @@
+table DimUser
+	lineageTag: 56dfdd17-7ef0-4c35-80ac-cd4157ae1a5f
+
+	column UserName
+		dataType: string
+		lineageTag: eba51fd6-070c-47d9-88a2-2934c4c43320
+		summarizeBy: none
+		isNameInferred
+		sourceColumn: [UserName]
+
+		annotation SummarizationSetBy = Automatic
+
+	partition DimUser = calculated
+		mode: import
+		source =
+				DISTINCT (
+				    UNION (
+				        SELECTCOLUMNS ( VALUES ( QueryEvents[UserName] ), "UserName", QueryEvents[UserName] ),
+				        SELECTCOLUMNS ( VALUES ( Feedback[UserName] ), "UserName", Feedback[UserName] )
+				    )
+				)
+
+	annotation PBI_ResultType = Table
+
