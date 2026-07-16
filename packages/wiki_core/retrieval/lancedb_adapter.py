@@ -128,11 +128,18 @@ class LanceDbVectorStore:
         top_k: int,
         filters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        if filters:
-            LOGGER.debug("Ignoring LanceDB filters in compatibility adapter: %s", filters)
         table = self._ensure_table()
         try:
-            results = table.search(embedding).limit(top_k).to_list()
+            query = table.search(embedding)
+            if filters:
+                # Equality filters only (e.g. {"type": "concept"}), applied before
+                # the vector search so top_k is honored within the filtered set.
+                clause = " AND ".join(
+                    f"{column} = '{str(value).replace(chr(39), chr(39) * 2)}'"
+                    for column, value in filters.items()
+                )
+                query = query.where(clause, prefilter=True)
+            results = query.limit(top_k).to_list()
         except Exception:
             LOGGER.error(
                 "LanceDB vector search failed on table '%s' (vector column type=%s). Vector "

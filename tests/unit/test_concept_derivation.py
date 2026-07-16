@@ -118,3 +118,42 @@ def test_no_map_keeps_legacy_behavior():
     citations = (_source("etc-training"),)
     assert derive_concepts(citations) == ("Unknown",)
     assert derive_concepts(citations, None) == ("Unknown",)
+
+
+# --- retrieval-based fallback (concept_candidates from diagnostics) ---
+
+
+CANDIDATES = (
+    {"title": "Estimate to Complete", "path": "wiki/concepts/estimate-to-complete.md", "distance": 1.06},
+    {"title": "Mission Support", "path": "wiki/concepts/mission-support.md", "distance": 1.30},
+)
+
+
+def test_fallback_accepts_candidate_within_margin():
+    citations = (_source("uncited-etc-variant"),)
+    result = derive_concepts(citations, {}, concept_candidates=CANDIDATES, top_distance=0.995)
+    # 1.06 <= 0.995 + 0.15 accepted; 1.30 rejected.
+    assert result == ("Estimate to Complete",)
+
+
+def test_fallback_rejects_candidates_beyond_margin():
+    citations = (_source("uncited"),)
+    far = ({"title": "Estimate to Complete", "path": "wiki/concepts/x.md", "distance": 1.5},)
+    assert derive_concepts(citations, {}, concept_candidates=far, top_distance=0.995) == ("Unknown",)
+
+
+def test_fallback_requires_top_distance():
+    citations = (_source("uncited"),)
+    assert derive_concepts(citations, {}, concept_candidates=CANDIDATES, top_distance=None) == ("Unknown",)
+
+
+def test_fallback_not_used_when_citations_already_matched():
+    citations = (_concept("Ramp Credit Card Coding"),)
+    result = derive_concepts(citations, {}, concept_candidates=CANDIDATES, top_distance=0.995)
+    assert result == ("Ramp Credit Card Coding",)
+
+
+def test_fallback_skips_candidates_without_numeric_distance():
+    citations = (_source("uncited"),)
+    bad = ({"title": "Estimate to Complete", "path": "wiki/concepts/x.md", "distance": None},)
+    assert derive_concepts(citations, {}, concept_candidates=bad, top_distance=0.995) == ("Unknown",)

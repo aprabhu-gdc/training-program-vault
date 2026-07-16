@@ -196,12 +196,35 @@ class QueryService:
         diagnostics = {
             "chunk_ids": [str(chunk.metadata.get("id", "")) for chunk in chunks],
             "top_k": self._settings.rag_top_k,
+            "top_distance": results[0].get("_distance") if results else None,
+            # Nearest concept pages regardless of overall rank: source pages
+            # heavily outnumber concept pages, so concept chunks are often pushed
+            # out of the main top_k. Analytics uses these (distance-gated) to
+            # attribute the query to a concept.
+            "concept_candidates": self._concept_candidates(query_embedding),
         }
         return QueryResponse(
             answer_text=strip_source_tags(clean_obsidian_links(answer)),
             citations=citations,
             retrieval_diagnostics=diagnostics,
         )
+
+    def _concept_candidates(self, query_embedding: list[float]) -> list[dict[str, Any]]:
+        """Nearest concept-typed chunks for the query; fail-soft (diagnostics only)."""
+
+        try:
+            rows = self._vector_store.search(query_embedding, top_k=3, filters={"type": "concept"})
+            return [
+                {
+                    "title": str(row.get("title", "Untitled")),
+                    "path": str(row.get("path", "")),
+                    "distance": row.get("_distance"),
+                }
+                for row in rows
+            ]
+        except Exception:
+            LOGGER.warning("Concept-candidate search failed; diagnostics omitted", exc_info=True)
+            return []
 
 
 async def query_vault_structured(query: str, request_id: str, **kwargs) -> QueryResponse:
