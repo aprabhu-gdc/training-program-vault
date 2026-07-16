@@ -47,6 +47,24 @@ class VaultIndexer:
         self._save_manifest(manifest)
         return IndexingReport(mode="build", indexed_files=indexed_files, deleted_files=[], chunk_count=len(rows))
 
+    def reconcile(self) -> IndexingReport:
+        """Bring the index into line with every wiki page on disk.
+
+        Diffs all wiki pages against the manifest and embeds only missing or
+        changed pages (and removes vanished ones), so it heals index drift —
+        e.g. pages pulled from SharePoint that were never handed to the indexer.
+        Cheap when nothing changed (sha diff only, no embedding calls).
+        """
+
+        report = self.upsert_modified_files(changed_paths=None)
+        LOGGER.info(
+            "Index reconcile complete indexed=%d deleted=%d chunks=%d",
+            len(report.indexed_files),
+            len(report.deleted_files),
+            report.chunk_count,
+        )
+        return report
+
     def upsert_modified_files(self, changed_paths: Iterable[Path] | None = None) -> IndexingReport:
         manifest = self._load_manifest()
         existing_files = {
@@ -57,7 +75,13 @@ class VaultIndexer:
         changed_relative_paths: set[str] = set()
         if changed_paths is None:
             for relative_path, path in existing_files.items():
-                sha256 = self._page_store.load_wiki_page(path).sha256
+                try:
+                    sha256 = self._page_store.load_wiki_page(path).sha256
+                except Exception:
+                    # One unreadable page (e.g. a partially-synced file) must not
+                    # abort a full reconcile of every other page.
+                    LOGGER.warning("Skipping unreadable wiki page during reconcile: %s", path, exc_info=True)
+                    continue
                 if manifest.get(relative_path) != sha256:
                     changed_relative_paths.add(relative_path)
         else:
