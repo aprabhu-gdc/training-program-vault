@@ -24,7 +24,8 @@ from packages.contracts.query import QueryAttachment, QueryRequest
 from packages.shared.documents.extract_text import SUPPORTED_EXTENSIONS, extract_text
 from teams_bot.cards import build_answer_card
 from teams_bot.config import Settings
-from teams_bot.services.analytics import AnalyticsService, ConceptMapResolver, derive_concepts
+from teams_bot.services.analytics import AnalyticsService, ConceptMapResolver, derive_concept
+from teams_bot.services.concept_labels import concept_label
 from teams_bot.services.feedback import FeedbackEvent, FeedbackLogger
 from teams_bot.services.ingest_admin_client import HttpIngestAdminClient
 from teams_bot.services.source_links import SourceLinkResolver
@@ -177,12 +178,12 @@ class GraydazeTrainingBot(TeamsActivityHandler):
             # runs off the event loop. mapping() is fail-soft and never raises.
             source_concepts = await asyncio.to_thread(self._concept_map.mapping)
             diagnostics = getattr(result, "retrieval_diagnostics", None) or {}
-            concepts = derive_concepts(
+            match = derive_concept(
                 getattr(result, "citations", ()),
                 source_concepts,
                 concept_candidates=diagnostics.get("concept_candidates"),
-                top_distance=diagnostics.get("top_distance"),
             )
+            label = concept_label(match.title, match.path)
             answer_activity = Activity(
                 type=ActivityTypes.message,
                 text=self._answer_preview(result.answer_text),
@@ -191,7 +192,7 @@ class GraydazeTrainingBot(TeamsActivityHandler):
                         request.request_id,
                         result.answer_text,
                         sources=self._build_source_links(getattr(result, "citations", ())),
-                        concepts=concepts,
+                        concepts=(label,),
                     )
                 ],
             )
@@ -201,7 +202,8 @@ class GraydazeTrainingBot(TeamsActivityHandler):
                     request_id=request.request_id,
                     user_id=request.identity.user_id,
                     user_name=request.identity.user_name,
-                    concepts=concepts,
+                    concept=label,
+                    concept_title=match.title,
                 )
             )
         except WikiIntegrationError as exc:

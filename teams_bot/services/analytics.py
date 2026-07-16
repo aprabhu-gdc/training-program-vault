@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Iterable, Mapping
 
@@ -21,79 +22,80 @@ from typing import Any, Iterable, Mapping
 LOGGER = logging.getLogger(__name__)
 
 UNKNOWN_CONCEPT = "Unknown"
-MAX_CONCEPTS_PER_QUERY = 3
 
 # How long a built source->concept map stays fresh. The wiki only changes when
 # an ingest sync runs, so brief staleness is acceptable.
 CONCEPT_MAP_TTL_SECONDS = 900.0
 
-# Fallback acceptance margin: a concept candidate from the type-filtered
-# retrieval pass counts only when its distance is within this much of the best
-# overall hit. Keeps genuinely off-topic queries classified as Unknown while
-# accepting concepts that were merely crowded out of the main top_k by the far
-# more numerous source pages.
-CONCEPT_DISTANCE_MARGIN = 0.15
+# Absolute cosine-distance ceiling for the nearest concept: at or below this the
+# query is "about" that concept; beyond it the query is off-topic -> Unknown.
+# Tuned against text-embedding-3-large: on-topic queries land ~0.7-1.25 from
+# their concept, off-topic queries ~1.7+, a wide and stable gap (relevance to
+# the nearest concept doesn't drift as the corpus grows). Edit this constant and
+# redeploy to re-tune; only the embedding model changing should require it.
+DEFAULT_CONCEPT_MAX_DISTANCE = 1.5
 
 
-def derive_concepts(
+@dataclass(frozen=True)
+class ConceptMatch:
+    """The single wiki concept a query was classified against (title + page path)."""
+
+    title: str
+    path: str = ""
+
+
+UNKNOWN_MATCH = ConceptMatch(UNKNOWN_CONCEPT)
+
+
+def derive_concept(
     citations: Iterable[Any],
-    source_concepts: Mapping[str, tuple[str, ...]] | None = None,
+    source_concepts: Mapping[str, tuple[ConceptMatch, ...]] | None = None,
     concept_candidates: Iterable[Mapping[str, Any]] | None = None,
-    top_distance: float | None = None,
-) -> tuple[str, ...]:
-    """Map rank-ordered citations to the concept titles the query was about.
+    max_distance: float = DEFAULT_CONCEPT_MAX_DISTANCE,
+) -> ConceptMatch:
+    """Classify a query as the single most relevant wiki concept.
 
-    Three passes, most precise first:
-    1. A citation whose ``page_type`` is ``concept`` (or whose path is under
-       ``wiki/concepts/``) counts as itself.
-    2. A source citation maps to the concepts citing it via ``source_concepts``
-       (built by ``ConceptMapResolver`` from concept frontmatter).
-    3. If nothing matched, fall back to ``concept_candidates`` — the nearest
-       concept-typed chunks from retrieval diagnostics — accepting only those
-       within ``CONCEPT_DISTANCE_MARGIN`` of ``top_distance`` (the best overall
-       hit). This covers concept pages crowded out of the main top_k and source
-       pages the (often stale) concept frontmatter never cited.
+    Primary signal (when ``concept_candidates`` — the relevance-ordered nearest
+    concept-typed chunks from retrieval diagnostics — are available): the single
+    nearest concept, accepted when its distance is at or below ``max_distance``,
+    else ``Unknown``. This absolute gate cleanly separates on-topic queries (near
+    a concept) from off-topic ones and needs no index-heal caveats.
 
-    Keeps retrieval rank order, dedupes by title (the analytics column is
-    title-keyed), caps at ``MAX_CONCEPTS_PER_QUERY``. No match yields
-    ``("Unknown",)``.
+    Fallback (candidates absent, e.g. a legacy text-only backend): the first
+    concept-typed citation in retrieval rank order, then the first source
+    citation mapped to a concept via ``source_concepts``, then ``Unknown``.
+
+    Returns exactly one ``ConceptMatch`` — the product wants a single label per
+    query even when several concepts are relevant.
     """
 
-    concepts: list[str] = []
-    seen: set[str] = set()
-
-    def _add(title: str) -> bool:
-        """Record a concept title; return True once the cap is reached."""
-
-        title = title.strip() or "Untitled"
-        if title not in seen:
-            seen.add(title)
-            concepts.append(title)
-        return len(concepts) >= MAX_CONCEPTS_PER_QUERY
-
-    for citation in citations or ():
-        if len(concepts) >= MAX_CONCEPTS_PER_QUERY:
-            break
-        path = str(getattr(citation, "path", "") or "")
-        page_type = str(getattr(citation, "page_type", "") or "")
-        if page_type == "concept" or path.startswith("wiki/concepts/"):
-            _add(str(getattr(citation, "title", "") or ""))
-            continue
-        for concept_title in (source_concepts or {}).get(path, ()):
-            if _add(concept_title):
-                break
-
-    if not concepts and concept_candidates and top_distance is not None:
+    if concept_candidates:
         for candidate in concept_candidates:
             distance = candidate.get("distance")
             if not isinstance(distance, (int, float)):
                 continue
-            if distance > top_distance + CONCEPT_DISTANCE_MARGIN:
-                continue
-            if _add(str(candidate.get("title") or "")):
-                break
+            # Candidates are distance-ordered, so the first with a numeric
+            # distance is the nearest concept — it alone decides the outcome.
+            title = str(candidate.get("title") or "").strip()
+            if distance <= max_distance and title:
+                return ConceptMatch(title, str(candidate.get("path") or ""))
+            return UNKNOWN_MATCH
+        return UNKNOWN_MATCH
 
-    return tuple(concepts) if concepts else (UNKNOWN_CONCEPT,)
+    for citation in citations or ():
+        path = str(getattr(citation, "path", "") or "")
+        page_type = str(getattr(citation, "page_type", "") or "")
+        if page_type == "concept" or path.startswith("wiki/concepts/"):
+            title = str(getattr(citation, "title", "") or "").strip() or "Untitled"
+            return ConceptMatch(title, path)
+
+    for citation in citations or ():
+        path = str(getattr(citation, "path", "") or "")
+        matches = (source_concepts or {}).get(path, ())
+        if matches:
+            return matches[0]
+
+    return UNKNOWN_MATCH
 
 
 class ConceptMapResolver:
@@ -110,11 +112,11 @@ class ConceptMapResolver:
     def __init__(self, settings: Any = None, ttl_seconds: float = CONCEPT_MAP_TTL_SECONDS) -> None:
         self._settings = settings
         self._ttl_seconds = ttl_seconds
-        self._mapping: dict[str, tuple[str, ...]] = {}
+        self._mapping: dict[str, tuple[ConceptMatch, ...]] = {}
         self._expires_at = 0.0
         self._warned = False
 
-    def mapping(self) -> Mapping[str, tuple[str, ...]]:
+    def mapping(self) -> Mapping[str, tuple[ConceptMatch, ...]]:
         """Return the current map, rebuilding when the TTL has lapsed.
 
         Synchronous (a cold build reads every wiki page); call via
@@ -143,7 +145,7 @@ class ConceptMapResolver:
         self._expires_at = time.monotonic() + self._ttl_seconds
         return self._mapping
 
-    def _build(self) -> dict[str, tuple[str, ...]]:
+    def _build(self) -> dict[str, tuple[ConceptMatch, ...]]:
         # Imported lazily so the bot has no hard dependency on wiki-core
         # configuration at import time (same posture as SourceLinkResolver).
         from packages.wiki_core.content.file_page_store import FilePageStore
@@ -153,7 +155,7 @@ class ConceptMapResolver:
             self._settings = CoreSettings.from_env()
         store = FilePageStore(self._settings)
 
-        mapping: dict[str, list[str]] = {}
+        mapping: dict[str, list[ConceptMatch]] = {}
         for path in store.iter_wiki_pages():
             try:
                 page = store.load_wiki_page(path)
@@ -162,17 +164,17 @@ class ConceptMapResolver:
                 continue
             if page.page_type != "concept":
                 continue
-            title = page.title.strip() or "Untitled"
+            match = ConceptMatch(page.title.strip() or "Untitled", page.relative_path)
             for source in page.sources:
                 normalized = str(source).strip().strip("/")
                 # Concept frontmatter can also reference raw/ files; only wiki
                 # pages appear as citation paths.
                 if not normalized.startswith("wiki/"):
                     continue
-                titles = mapping.setdefault(normalized, [])
-                if title not in titles:
-                    titles.append(title)
-        return {source: tuple(titles) for source, titles in mapping.items()}
+                matches = mapping.setdefault(normalized, [])
+                if not any(existing.title == match.title for existing in matches):
+                    matches.append(match)
+        return {source: tuple(matches) for source, matches in mapping.items()}
 
 
 def _utc_timestamp() -> str:
@@ -230,26 +232,29 @@ class AnalyticsService:
         request_id: str,
         user_id: str | None,
         user_name: str | None,
-        concepts: Iterable[str],
+        concept: str,
+        concept_title: str,
     ) -> None:
-        """Record one row per matched concept for an answered query."""
+        """Record one row for an answered query's single most-relevant concept.
+
+        ``concept`` is the short dashboard label; ``concept_title`` is the full
+        wiki concept title, stored in the built-in Title column.
+        """
 
         try:
             client = self._get_client()
             if client is None:
                 return
-            timestamp = _utc_timestamp()
-            for concept in concepts:
-                fields = {
-                    "Title": concept,
-                    "Timestamp": timestamp,
-                    "RequestId": request_id,
-                    "UserId": user_id or "",
-                    "UserName": user_name or "",
-                    "Concept": concept,
-                    "IsUnknown": concept == UNKNOWN_CONCEPT,
-                }
-                await asyncio.to_thread(client.create_item, self._query_list, fields)
+            fields = {
+                "Title": concept_title or concept,
+                "Timestamp": _utc_timestamp(),
+                "RequestId": request_id,
+                "UserId": user_id or "",
+                "UserName": user_name or "",
+                "Concept": concept,
+                "IsUnknown": concept == UNKNOWN_CONCEPT,
+            }
+            await asyncio.to_thread(client.create_item, self._query_list, fields)
         except Exception:
             LOGGER.warning(
                 "Dropped query analytics event request_id=%s", request_id, exc_info=True

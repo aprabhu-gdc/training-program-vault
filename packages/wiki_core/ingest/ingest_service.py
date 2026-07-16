@@ -62,7 +62,19 @@ class AutoIngestService:
             for event in self._source_sync.list_files_recursive(folder_path)
             if Path(event.path).suffix.lower() in SUPPORTED_EXTENSIONS
         ]
-        return self.sync_events(events, download_missing=True)
+        report = self.sync_events(events, download_missing=True)
+
+        # The per-file upsert above only indexes LLM-regenerated pages. Pages
+        # pulled from SharePoint by _refresh_local_wiki_from_sharepoint (and any
+        # page that predates the current index) are now on local disk but may be
+        # absent from the index. Reconcile heals that drift on every full sync.
+        # Fail-soft: a reconcile failure must not undo the sync that succeeded.
+        try:
+            self._indexer.reconcile()
+        except Exception:
+            LOGGER.exception("Index reconcile after full sync failed; targeted upsert results stand")
+
+        return report
 
     def sync_events(self, events: Iterable[Any], *, download_missing: bool = True) -> SyncReport:
         events = list(events)

@@ -18,17 +18,21 @@ notified via the bot's welcome message and a footer on every answer card.
 
 ## The two lists
 
-### `TrainingBotQueryEvents` — one row per (answered question × matched concept)
+### `TrainingBotQueryEvents` — one row per answered question
+
+Each question is classified as its **single most relevant** wiki concept.
 
 | Column | Type | Notes |
 | --- | --- | --- |
-| Title | text | Same as Concept (SharePoint's built-in column) |
+| Title | text | Full concept title (SharePoint's built-in column), e.g. "Estimate to Complete" |
 | Timestamp | dateTime | UTC, ISO 8601 |
-| RequestId | text | Groups rows from the same question (max 3 concepts per question) |
+| RequestId | text | The answered question (one row per question) |
 | UserId | text | Teams user id (stable, opaque) |
 | UserName | text | Teams display name — use for the user slicer |
-| Concept | text | Wiki concept title, or `Unknown` |
-| IsUnknown | boolean | True when no wiki concept matched |
+| Concept | text | **Short dashboard label** (e.g. `ETC`, `RAMP`), or `Unknown` — use this on chart axes |
+| IsUnknown | boolean | True when no wiki concept was relevant |
+
+> Labels come from `teams_bot/services/concept_labels.py` (a slug→label override table plus an acronym heuristic for new concepts). **Rows written before 2026-07-16 store the full title in `Concept`**, so a bar chart by `Concept` shows both "Estimate to Complete" and "ETC" as separate bars until the historical rows are relabeled or filtered out (`Timestamp` slicer) — an owner decision, not a code change.
 
 ### `TrainingBotFeedback` — one row per feedback submission
 
@@ -40,7 +44,7 @@ notified via the bot's welcome message and a footer on every answer card.
 | UserId / UserName | text | As above |
 | Rating | text | `helpful` or `inaccurate` |
 | Comment | multiline text | Optional free text typed on the answer card |
-| Concepts | text | `"; "`-joined concept titles of the answered question |
+| Concepts | text | The answered question's concept label (older rows may hold `"; "`-joined titles) |
 
 ## Provisioning the lists
 

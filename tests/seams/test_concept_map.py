@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from packages.contracts.query import Citation
-from teams_bot.services.analytics import ConceptMapResolver, derive_concepts
+from teams_bot.services.analytics import ConceptMapResolver, ConceptMatch, derive_concept
 from tests.conftest import make_core_settings
 
 
@@ -65,10 +65,12 @@ def test_builds_inverse_map_from_concept_frontmatter(tmp_path):
 
     mapping = ConceptMapResolver(settings).mapping()
 
-    assert mapping["wiki/sources/etc-training.md"] == ("Estimate to Complete",)
+    assert mapping["wiki/sources/etc-training.md"] == (
+        ConceptMatch("Estimate to Complete", "wiki/concepts/estimate-to-complete.md"),
+    )
     assert mapping["wiki/sources/pm-101-crd.md"] == (
-        "Estimate to Complete",
-        "Graydaze Project Manager Role",
+        ConceptMatch("Estimate to Complete", "wiki/concepts/estimate-to-complete.md"),
+        ConceptMatch("Graydaze Project Manager Role", "wiki/concepts/graydaze-project-manager-role.md"),
     )
     # raw/ entries and source pages themselves are not keys.
     assert not any(key.startswith("raw/") for key in mapping)
@@ -80,7 +82,8 @@ def test_end_to_end_source_citation_classifies_concept(tmp_path):
     mapping = ConceptMapResolver(settings).mapping()
 
     citation = Citation(title="ETC Training", path="wiki/sources/etc-training.md", page_type="source")
-    assert derive_concepts((citation,), mapping) == ("Estimate to Complete",)
+    match = derive_concept((citation,), mapping)
+    assert match == ConceptMatch("Estimate to Complete", "wiki/concepts/estimate-to-complete.md")
 
 
 def test_broken_settings_fail_soft_with_single_warning(caplog):
@@ -103,7 +106,9 @@ def test_malformed_page_is_skipped(tmp_path):
     (settings.wiki_root / "concepts" / "broken.md").write_bytes(b"\xff\xfe\x00broken")
 
     mapping = ConceptMapResolver(settings).mapping()
-    assert mapping["wiki/sources/etc-training.md"] == ("Estimate to Complete",)
+    assert mapping["wiki/sources/etc-training.md"] == (
+        ConceptMatch("Estimate to Complete", "wiki/concepts/estimate-to-complete.md"),
+    )
 
 
 def test_ttl_refresh_picks_up_new_concepts(tmp_path):
@@ -116,4 +121,6 @@ def test_ttl_refresh_picks_up_new_concepts(tmp_path):
         "---\ntitle: New Concept\ntype: concept\nsources:\n  - wiki/sources/new-source.md\n---\n\nBody.\n",
         encoding="utf-8",
     )
-    assert resolver.mapping()["wiki/sources/new-source.md"] == ("New Concept",)
+    assert resolver.mapping()["wiki/sources/new-source.md"] == (
+        ConceptMatch("New Concept", "wiki/concepts/new-concept.md"),
+    )

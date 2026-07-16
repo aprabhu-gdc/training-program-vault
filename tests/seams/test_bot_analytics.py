@@ -36,30 +36,31 @@ class FakeListClient:
 # --- AnalyticsService payloads ---
 
 
-async def test_record_query_writes_one_row_per_concept_matching_list_columns():
+async def test_record_query_writes_one_row_with_label_and_full_title():
     client = FakeListClient()
     service = AnalyticsService(client=client)
     await service.record_query(
         request_id="req-1",
         user_id="29:user",
         user_name="Pat PM",
-        concepts=("Estimate to Complete", "Mission Support"),
+        concept="ETC",
+        concept_title="Estimate to Complete",
     )
 
-    assert [name for name, _ in client.items] == ["TrainingBotQueryEvents"] * 2
-    allowed = {"Title"} | {column["name"] for column in QUERY_EVENT_COLUMNS}
-    for _, fields in client.items:
-        assert set(fields) == allowed
-        assert fields["IsUnknown"] is False
-    assert client.items[0][1]["Concept"] == "Estimate to Complete"
-    assert client.items[1][1]["Concept"] == "Mission Support"
+    assert [name for name, _ in client.items] == ["TrainingBotQueryEvents"]
+    _, fields = client.items[0]
+    assert set(fields) == {"Title"} | {column["name"] for column in QUERY_EVENT_COLUMNS}
+    # Short label in Concept (dashboard axis); full title in the built-in Title.
+    assert fields["Concept"] == "ETC"
+    assert fields["Title"] == "Estimate to Complete"
+    assert fields["IsUnknown"] is False
 
 
 async def test_record_query_marks_unknown():
     client = FakeListClient()
     service = AnalyticsService(client=client)
     await service.record_query(
-        request_id="req-2", user_id=None, user_name=None, concepts=("Unknown",)
+        request_id="req-2", user_id=None, user_name=None, concept="Unknown", concept_title="Unknown"
     )
     _, fields = client.items[0]
     assert fields["Concept"] == "Unknown"
@@ -89,7 +90,7 @@ async def test_record_feedback_matches_list_columns():
 
 async def test_record_methods_swallow_write_failures():
     service = AnalyticsService(client=FakeListClient(raise_on_write=RuntimeError("boom")))
-    await service.record_query(request_id="r", user_id=None, user_name=None, concepts=("C",))
+    await service.record_query(request_id="r", user_id=None, user_name=None, concept="C", concept_title="C")
     await service.record_feedback(
         request_id="r", user_id=None, user_name=None, rating="helpful", comment="", concepts=()
     )
@@ -98,7 +99,7 @@ async def test_record_methods_swallow_write_failures():
 async def test_disabled_via_settings_records_nothing(tmp_path):
     settings = make_core_settings(tmp_path, analytics_enabled=False)
     service = AnalyticsService(settings=settings)
-    await service.record_query(request_id="r", user_id=None, user_name=None, concepts=("C",))
+    await service.record_query(request_id="r", user_id=None, user_name=None, concept="C", concept_title="C")
     assert service._client is None
 
 
@@ -106,7 +107,7 @@ async def test_init_failure_disables_for_process_lifetime(tmp_path):
     # Missing SharePoint auth makes SharePointListClient construction raise.
     settings = make_core_settings(tmp_path, sharepoint_tenant_id="")
     service = AnalyticsService(settings=settings)
-    await service.record_query(request_id="r", user_id=None, user_name=None, concepts=("C",))
+    await service.record_query(request_id="r", user_id=None, user_name=None, concept="C", concept_title="C")
     assert service._attempted is True and service._client is None
 
 
