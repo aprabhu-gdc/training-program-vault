@@ -106,8 +106,8 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         typing_task = asyncio.create_task(self._typing_loop(turn_context))
 
         try:
-            await self._send_welcome_if_needed(turn_context)
-
+            # The welcome is sent once when the bot is added to a chat
+            # (on_members_added_activity), never before answering a message.
             query_text = self._extract_message_text(turn_context)
             if self._is_sync_command(query_text):
                 await self._handle_sync_command(turn_context)
