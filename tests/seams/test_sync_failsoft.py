@@ -135,6 +135,39 @@ def test_report_page_is_excluded_from_indexing(tmp_path):
     assert "last-sync.md" not in pages
 
 
+def test_sync_events_drives_the_progress_reporter(tmp_path):
+    """Real sync_events + real FileProgressReporter: the progress file reflects
+    per-file outcomes (the wiring the Teams card depends on)."""
+
+    from packages.wiki_core.ingest.progress import FileProgressReporter, read_progress
+
+    service = _service(tmp_path)
+
+    def ingest(local_path):
+        if "bad" in str(local_path):
+            raise ValueError("corrupt")
+        if "scan" in str(local_path):
+            return IngestFileResult(updated_paths=[], empty=True)
+        return IngestFileResult(updated_paths=["wiki/sources/ok.md"], empty=False)
+
+    service._ingest_local_file = MagicMock(side_effect=ingest)  # noqa: SLF001
+
+    progress_path = tmp_path / "sync-progress.json"
+    reporter = FileProgressReporter(progress_path, job_id="j", job_type="manual")
+    reporter.start()
+    service.sync_events(
+        [_event("raw/sources/ok.pdf"), _event("raw/sources/bad.pdf"), _event("raw/sources/scan.pdf")],
+        progress=reporter,
+    )
+
+    rec = read_progress(progress_path)
+    assert rec["files_total"] == 3
+    assert rec["updated_files"] == 1
+    assert rec["empty_files"] == 1
+    assert len(rec["failed_files"]) == 1
+    assert rec["files_done"] == 3
+
+
 def test_publish_and_index_happen_before_state_is_saved(tmp_path):
     """If publish/index throws, state must not have been written (no
     processed-but-not-published files)."""

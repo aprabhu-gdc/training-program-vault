@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from typing import Any
 
 from packages.contracts.sync import SourceFileEvent
@@ -12,6 +13,7 @@ from packages.shared.documents.extract_text import CONVERTIBLE_EXTENSIONS, SUPPO
 from packages.shared.logging import configure_logging
 from packages.shared.messaging.service_bus import process_queue_messages
 from packages.wiki_core.ingest.ingest_service import AutoIngestService
+from packages.wiki_core.ingest.progress import FileProgressReporter
 
 from .config import WorkerSettings
 
@@ -53,7 +55,19 @@ def _process_job(payload: dict[str, Any], service: AutoIngestService) -> None:
     LOGGER.info("Processing source sync job job_id=%s job_type=%s", job_id, job_type)
 
     if job_type == "manual":
-        service.sync_all_training_files()
+        reporter = FileProgressReporter(
+            service._settings.sync_progress_path,
+            job_id=job_id,
+            job_type="manual",
+            requested_by_user_name=(str(payload.get("requested_by_user_name")) if payload.get("requested_by_user_name") else None),
+        )
+        reporter.start()
+        try:
+            service.sync_all_training_files(progress=reporter)
+        except Exception as exc:
+            reporter.finish_error(f"{type(exc).__name__}: {exc}")
+            raise
+        reporter.finish_ok()
         processed_job_ids.add(job_id)
         _save_processed_jobs(service, processed_job_ids)
         return
@@ -125,10 +139,19 @@ def _run_reconcile(service: AutoIngestService) -> None:
     """
 
     LOGGER.info("Running scheduled reconciliation sync")
+    reporter = FileProgressReporter(
+        service._settings.sync_progress_path,
+        job_id=uuid.uuid4().hex,
+        job_type="scheduled",
+    )
+    reporter.start()
     try:
-        service.sync_all_training_files()
-    except Exception:
+        service.sync_all_training_files(progress=reporter)
+    except Exception as exc:
+        reporter.finish_error(f"{type(exc).__name__}: {exc}")
         LOGGER.exception("Reconciliation sync failed; retrying next interval")
+        return
+    reporter.finish_ok()
 
 
 def main() -> int:

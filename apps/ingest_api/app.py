@@ -13,6 +13,7 @@ from aiohttp import web
 from packages.contracts.sync import SourceFileEvent, SyncJobAccepted, SyncJobMessage
 from packages.shared.documents.extract_text import SUPPORTED_EXTENSIONS
 from packages.shared.messaging.service_bus import send_json_message
+from packages.wiki_core.ingest.progress import is_stale, read_progress, write_queued
 from packages.wiki_core.ingest.sharepoint_adapter import SharePointSourceSyncAdapter
 from packages.wiki_core.ingest.subscription_manager import SubscriptionManager
 from packages.wiki_core.settings import CoreSettings
@@ -71,6 +72,12 @@ def create_app() -> web.Application:
     async def healthcheck(_: web.Request) -> web.Response:
         return web.json_response({"status": "ok"})
 
+    async def sync_status(_: web.Request) -> web.Response:
+        record = read_progress(core_settings.sync_progress_path)
+        if record is None:
+            return web.json_response({"status": "none"})
+        return web.json_response(record)
+
     async def manual_sync(request: web.Request) -> web.Response:
         if request.content_type != "application/json":
             return web.json_response({"error": "Only application/json payloads are supported."}, status=415)
@@ -81,6 +88,16 @@ def create_app() -> web.Application:
         if not isinstance(body, dict):
             return web.json_response({"error": "Sync payload must be a JSON object."}, status=400)
 
+        # The vault index is global: one sync serves everyone. If a fresh job is
+        # already queued/running, return it (409) instead of enqueuing a duplicate
+        # so a second user's /sync attaches to the in-flight job's live status.
+        current = read_progress(core_settings.sync_progress_path)
+        if current and current.get("status") in {"queued", "running"} and not is_stale(current):
+            return web.json_response({"status": "already_running", "progress": current}, status=409)
+
+        requested_by_user_name = (
+            str(body.get("requested_by_user_name")) if body.get("requested_by_user_name") is not None else None
+        )
         accepted = _queue_job(
             settings,
             SyncJobMessage(
@@ -88,10 +105,21 @@ def create_app() -> web.Application:
                 job_type="manual",
                 payload=None,
                 requested_by_user_id=(str(body.get("requested_by_user_id")) if body.get("requested_by_user_id") is not None else None),
-                requested_by_user_name=(str(body.get("requested_by_user_name")) if body.get("requested_by_user_name") is not None else None),
+                requested_by_user_name=requested_by_user_name,
                 source="teams-manual-sync",
             ),
         )
+        # Best-effort initial record so a status poll right after enqueue shows
+        # "queued" before the worker picks the job up. Never block the enqueue.
+        try:
+            write_queued(
+                core_settings.sync_progress_path,
+                job_id=accepted.job_id,
+                job_type="manual",
+                requested_by_user_name=requested_by_user_name,
+            )
+        except OSError:
+            LOGGER.warning("Failed to write initial queued sync-progress record", exc_info=True)
         return web.json_response({"job_id": accepted.job_id, "status": accepted.status}, status=202)
 
     async def sharepoint_webhook(request: web.Request) -> web.Response:
@@ -150,6 +178,7 @@ def create_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/healthz", healthcheck)
     app.router.add_post("/admin/sync", manual_sync)
+    app.router.add_get("/admin/sync/status", sync_status)
     app.router.add_post("/api/webhooks/sharepoint", sharepoint_webhook)
     app.cleanup_ctx.append(_subscription_loop)
     app["settings"] = settings

@@ -18,6 +18,7 @@ from packages.shared.documents.extract_text import (
 from packages.wiki_core.ai.legacy_provider_gateway import LegacyProviderGateway
 from packages.wiki_core.content.file_page_store import FilePageStore
 from packages.wiki_core.content.markdown import slugify
+from packages.wiki_core.ingest.progress import ProgressReporter
 from packages.wiki_core.ingest.sharepoint_adapter import SharePointSourceSyncAdapter
 from packages.wiki_core.retrieval.index_service import IndexingReport, VaultIndexer
 from packages.wiki_core.settings import CoreSettings
@@ -73,8 +74,11 @@ class AutoIngestService:
         ]
         return self.sync_events(events)
 
-    def sync_all_training_files(self) -> SyncReport:
+    def sync_all_training_files(self, progress: ProgressReporter | None = None) -> SyncReport:
+        progress = progress or ProgressReporter()
+        progress.phase("refreshing_wiki")
         self._refresh_local_wiki_from_sharepoint()
+        progress.phase("listing")
         folder_path = self._settings.normalized_sharepoint_raw_root_path
         all_files = self._source_sync.list_files_recursive(folder_path)
         events = [event for event in all_files if Path(event.path).suffix.lower() in INGESTIBLE_EXTENSIONS]
@@ -87,14 +91,18 @@ class AutoIngestService:
             if suffix not in INGESTIBLE_EXTENSIONS:
                 key = suffix or "(no extension)"
                 unsupported_files[key] = unsupported_files.get(key, 0) + 1
+        progress.set_unsupported(unsupported_files)
 
-        report = self.sync_events(events, download_missing=True, unsupported_files=unsupported_files)
+        report = self.sync_events(
+            events, download_missing=True, unsupported_files=unsupported_files, progress=progress
+        )
 
         # The per-file upsert above only indexes LLM-regenerated pages. Pages
         # pulled from SharePoint by _refresh_local_wiki_from_sharepoint (and any
         # page that predates the current index) are now on local disk but may be
         # absent from the index. Reconcile heals that drift on every full sync.
         # Fail-soft: a reconcile failure must not undo the sync that succeeded.
+        progress.phase("indexing")
         try:
             self._indexer.reconcile()
         except Exception:
@@ -109,7 +117,9 @@ class AutoIngestService:
         *,
         download_missing: bool = True,
         unsupported_files: dict[str, int] | None = None,
+        progress: ProgressReporter | None = None,
     ) -> SyncReport:
+        progress = progress or ProgressReporter()
         events = list(events)
         state = self._load_state()
         downloaded_files: list[str] = []
@@ -119,12 +129,16 @@ class AutoIngestService:
         empty_extraction_files: list[str] = []
         processed_state: dict[str, str] = {}
 
+        progress.phase("processing")
+        progress.set_total(len(events))
         for event in events:
             event_key = self._event_key(event)
             if event_key and state.get(event.path) == event_key:
                 skipped_files.append(event.path)
+                progress.record("skipped_unchanged", path=event.path)
                 continue
 
+            progress.begin_file(event.path)
             # Fail-soft: one unreadable source (corrupt PDF, Graph download error,
             # LLM returning invalid JSON) must not abort the whole sync and strand
             # every other file. Record it and move on; it retries next sync because
@@ -135,18 +149,23 @@ class AutoIngestService:
                     local_path = self._source_sync.download_file(event.path)
                 elif not local_path.exists():
                     skipped_files.append(event.path)
+                    progress.record("skipped_unchanged", path=event.path)
                     continue
 
                 result = self._ingest_local_file(local_path)
             except Exception as exc:
                 LOGGER.exception("Ingest failed for source file path=%s", event.path)
                 failed_files.append({"path": event.path, "error": f"{type(exc).__name__}: {exc}"})
+                progress.record("failed", path=event.path, error=f"{type(exc).__name__}: {exc}")
                 continue
 
             downloaded_files.append(event.path)
             updated_wiki_files.extend(result.updated_paths)
             if result.empty:
                 empty_extraction_files.append(event.path)
+                progress.record("empty", path=event.path)
+            else:
+                progress.record("updated", path=event.path)
             if event_key:
                 processed_state[event.path] = event_key
 
