@@ -22,12 +22,25 @@ from botbuilder.schema import Activity, ActivityTypes, Attachment, InvokeRespons
 from packages.contracts.identity import CallerIdentity
 from packages.contracts.query import QueryAttachment, QueryRequest
 from packages.shared.documents.extract_text import SUPPORTED_EXTENSIONS, extract_text
-from teams_bot.cards import build_answer_card, build_sync_progress_card
+from teams_bot.cards import (
+    build_admin_confirm_card,
+    build_admin_job_card,
+    build_admin_result_card,
+    build_answer_card,
+    build_sync_progress_card,
+)
+from teams_bot.commands import COMMANDS, ParsedCommand, parse_command
 from teams_bot.config import Settings
+from teams_bot.services.admin_preview import (
+    RemovePreviewError,
+    build_clean_preview,
+    build_remove_preview,
+)
 from teams_bot.services.analytics import AnalyticsService, ConceptMapResolver, derive_concept
 from teams_bot.services.concept_labels import concept_label
 from teams_bot.services.feedback import FeedbackEvent, FeedbackLogger
 from teams_bot.services.ingest_admin_client import HttpIngestAdminClient
+from teams_bot.services.pending_actions import PendingActionStore
 from teams_bot.services.source_links import SourceLinkResolver
 from teams_bot.services.sync_monitor import SyncProgressMonitor
 from teams_bot.services.wiki_query import (
@@ -68,6 +81,8 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         # Strong references keep fire-and-forget analytics tasks alive until done.
         self._analytics_tasks: set[asyncio.Task] = set()
         self._source_links = SourceLinkResolver()
+        # Destructive admin actions await confirmation here (in-memory, TTL'd).
+        self._pending_actions = PendingActionStore()
         # Use a simple boolean property rather than a custom object so the state
         # remains JSON-serializable across real storage providers.
         self._welcome_accessor = self._user_state.create_property("HasSeenWelcome")
@@ -100,6 +115,20 @@ class GraydazeTrainingBot(TeamsActivityHandler):
             await self._handle_feedback(turn_context)
             return
 
+        # Adaptive Card Confirm/Cancel for a destructive admin action.
+        if self._is_admin_card_action(turn_context.activity):
+            await self._handle_admin_confirmation(turn_context)
+            return
+
+        # Slash commands are dispatched before any typing indicator and are NEVER
+        # forwarded to the wiki query path (so `/remove …` from a non-admin can't
+        # be answered as a hallucinated question).
+        query_text = self._extract_message_text(turn_context)
+        parsed = parse_command(query_text)
+        if parsed is not None:
+            await self._dispatch_command(turn_context, parsed)
+            return
+
         # Send typing synchronously first so Teams users get immediate feedback,
         # then continue sending periodic typing activities while the query runs.
         await turn_context.send_activity(Activity(type=ActivityTypes.typing))
@@ -107,11 +136,6 @@ class GraydazeTrainingBot(TeamsActivityHandler):
 
         try:
             await self._send_welcome_if_needed(turn_context)
-
-            query_text = self._extract_message_text(turn_context)
-            if self._is_sync_command(query_text):
-                await self._handle_sync_command(turn_context)
-                return
 
             incoming_attachments = [
                 attachment
@@ -279,6 +303,10 @@ class GraydazeTrainingBot(TeamsActivityHandler):
 
         if self._is_feedback_submission(turn_context.activity):
             await self._handle_feedback(turn_context)
+            return InvokeResponse(status=200)
+
+        if self._is_admin_card_action(turn_context.activity):
+            await self._handle_admin_confirmation(turn_context)
             return InvokeResponse(status=200)
 
         return await super().on_invoke_activity(turn_context)
@@ -596,10 +624,306 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         text = text.replace("&nbsp;", " ")
         return text.strip()
 
+    # --- Command dispatch ----------------------------------------------------
+
     @staticmethod
-    def _is_sync_command(text: str) -> bool:
-        normalized = text.strip().lower()
-        return normalized == "/sync" or normalized.startswith("/sync ")
+    def _sender_identity(turn_context: TurnContext) -> tuple[str | None, str | None]:
+        prop = turn_context.activity.from_property
+        aad = getattr(prop, "aad_object_id", None) if prop else None
+        name = prop.name if prop else None
+        return (aad.lower() if aad else None), name
+
+    def _is_admin(self, turn_context: TurnContext) -> bool:
+        aad, _ = self._sender_identity(turn_context)
+        return bool(self._settings.admin_object_ids) and aad is not None and aad in self._settings.admin_object_ids
+
+    @staticmethod
+    def _is_admin_card_action(activity: Activity) -> bool:
+        return bool(
+            activity
+            and isinstance(activity.value, dict)
+            and activity.value.get("action") in {"admin_confirm", "admin_cancel"}
+        )
+
+    async def _dispatch_command(self, turn_context: TurnContext, parsed: ParsedCommand) -> None:
+        spec = parsed.spec
+        if spec is None:
+            await turn_context.send_activity(f"Unknown command `/{parsed.raw_name}`. Try /help.")
+            return
+
+        if spec.name == "help":
+            await self._handle_help(turn_context)
+            return
+        if spec.name == "whoami":
+            await self._handle_whoami(turn_context)
+            return
+
+        # Everything below is admin-only.
+        aad, _name = self._sender_identity(turn_context)
+        if not self._is_admin(turn_context):
+            if not self._settings.admin_object_ids:
+                await turn_context.send_activity(
+                    "Admin commands are disabled: no admin allowlist is configured (BOT_ADMIN_OBJECT_IDS)."
+                )
+            else:
+                await turn_context.send_activity(
+                    "That’s an admin-only command. Ask a vault admin, or use /whoami to share your ID with them."
+                )
+            LOGGER.info("Denied admin command command=%s aad_object_id=%s", spec.name, aad)
+            return
+
+        LOGGER.info("Admin command dispatched command=%s aad_object_id=%s", spec.name, aad)
+        if spec.name == "sync":
+            await self._handle_sync_command(turn_context)
+        elif spec.name == "stopsync":
+            await self._handle_stopsync_command(turn_context)
+        elif spec.name == "remove":
+            await self._handle_remove(turn_context, parsed.args)
+        elif spec.name == "clean":
+            await self._handle_clean(turn_context)
+        elif spec.name == "lint":
+            await self._handle_lint(turn_context)
+
+    async def _handle_whoami(self, turn_context: TurnContext) -> None:
+        prop = turn_context.activity.from_property
+        aad = getattr(prop, "aad_object_id", None) if prop else None
+        name = (prop.name if prop else None) or "there"
+        if aad:
+            message = (
+                f"**{name}**\n\nYour Entra object ID:\n`{aad}`\n\n"
+                "To grant admin access, add this ID to the `BOT_ADMIN_OBJECT_IDS` app setting."
+            )
+        else:
+            fallback = (prop.id if prop else None) or "unknown"
+            message = (
+                f"**{name}**\n\nI can’t see your Entra object ID on this surface "
+                f"(common in the Bot Framework Emulator). Channel identity: `{fallback}`."
+            )
+        await turn_context.send_activity(message)
+
+    async def _handle_help(self, turn_context: TurnContext) -> None:
+        lines = ["**Graydaze PM Training Vault — commands**", ""]
+        for spec in COMMANDS.values():
+            tag = " _(admin)_" if spec.admin_only else ""
+            lines.append(f"- `{spec.usage}` — {spec.description}{tag}")
+        lines.append("")
+        lines.append("Or just ask a training question in plain language.")
+        await turn_context.send_activity("\n".join(lines))
+
+    async def _handle_stopsync_command(self, turn_context: TurnContext) -> None:
+        _aad, user_name = self._sender_identity(turn_context)
+        try:
+            result = await self._ingest_admin_client.request_cancel(requested_by_user_name=user_name)
+        except Exception:
+            LOGGER.exception("Teams stopsync failed")
+            await turn_context.send_activity(
+                "I couldn’t reach the ingest service to stop the refresh. Check the app logs for details."
+            )
+            return
+
+        if result.no_active_sync:
+            await turn_context.send_activity("No vault refresh is running right now. Use /sync to start one.")
+        elif result.cancelled_stale:
+            await turn_context.send_activity(
+                "The last refresh had stopped responding (no worker heartbeat), so I’ve marked it cancelled. "
+                "You can start a fresh one with /sync."
+            )
+        elif (result.progress or {}).get("status") == "queued":
+            await turn_context.send_activity("Cancelled the queued refresh before it started.")
+        else:
+            await turn_context.send_activity(
+                "Stop requested. The refresh will finish the file it’s currently processing and then stop — "
+                "this can take a few minutes for a large file. The progress card will update when it’s done."
+            )
+
+    async def _handle_remove(self, turn_context: TurnContext, args: str) -> None:
+        if not args:
+            await turn_context.send_activity("Usage: `/remove wiki/path/to/page.md`")
+            return
+        try:
+            preview = await asyncio.to_thread(build_remove_preview, args)
+        except RemovePreviewError as exc:
+            await turn_context.send_activity(str(exc))
+            return
+        except Exception:
+            LOGGER.exception("Remove preview failed for arg=%s", args)
+            await turn_context.send_activity("I couldn’t build a preview for that page. Check the app logs.")
+            return
+
+        aad, name = self._sender_identity(turn_context)
+        conversation_id = turn_context.activity.conversation.id if turn_context.activity.conversation else None
+        action = self._pending_actions.create(
+            command="remove",
+            payload={"path": preview.relative_path},
+            initiator_aad_object_id=aad or "",
+            initiator_name=name,
+            conversation_id=conversation_id,
+        )
+        card = build_admin_confirm_card(
+            title=f"Remove `{preview.relative_path}`?",
+            facts=preview.facts,
+            warnings=preview.warnings,
+            token=action.token,
+            initiator_name=name,
+        )
+        response = await turn_context.send_activity(Activity(type=ActivityTypes.message, attachments=[card]))
+        action.payload["preview_activity_id"] = getattr(response, "id", None)
+
+    async def _handle_clean(self, turn_context: TurnContext) -> None:
+        try:
+            preview = await asyncio.to_thread(build_clean_preview)
+        except Exception:
+            LOGGER.warning("Clean preview failed; submitting without a preview", exc_info=True)
+            preview = None
+
+        if preview and preview.will_delete:
+            aad, name = self._sender_identity(turn_context)
+            conversation_id = turn_context.activity.conversation.id if turn_context.activity.conversation else None
+            action = self._pending_actions.create(
+                command="clean",
+                payload={},
+                initiator_aad_object_id=aad or "",
+                initiator_name=name,
+                conversation_id=conversation_id,
+            )
+            doomed = ", ".join(f"`{p}`" for p in preview.delete_paths[:25])
+            card = build_admin_confirm_card(
+                title="Run vault cleanup?",
+                facts=preview.facts,
+                warnings=[f"{len(preview.delete_paths)} stale index entries will be deleted: {doomed}"],
+                token=action.token,
+                initiator_name=name,
+            )
+            response = await turn_context.send_activity(Activity(type=ActivityTypes.message, attachments=[card]))
+            action.payload["preview_activity_id"] = getattr(response, "id", None)
+            return
+
+        note = (
+            "Index looks clean — running a hygiene pass to prune stale state…"
+            if preview
+            else "Running a vault hygiene pass…"
+        )
+        await turn_context.send_activity(note)
+        await self._submit_admin_job(turn_context, job_type="clean")
+
+    async def _handle_lint(self, turn_context: TurnContext) -> None:
+        await turn_context.send_activity("Starting a vault lint — I’ll post progress here.")
+        await self._submit_admin_job(turn_context, job_type="lint")
+
+    async def _submit_admin_job(
+        self,
+        turn_context: TurnContext,
+        *,
+        job_type: str,
+        payload: dict[str, Any] | None = None,
+        replace_activity_id: str | None = None,
+    ) -> None:
+        _aad, user_name = self._sender_identity(turn_context)
+        try:
+            result = await self._ingest_admin_client.request_admin_job(
+                job_type=job_type,
+                payload=payload,
+                requested_by_user_id=(
+                    turn_context.activity.from_property.id if turn_context.activity.from_property else None
+                ),
+                requested_by_user_name=user_name,
+            )
+        except Exception:
+            LOGGER.exception("Admin job submit failed job_type=%s", job_type)
+            await turn_context.send_activity(
+                "The job could not be queued. Check the ingest service and app logs for details."
+            )
+            return
+
+        if result.status == "sync_running":
+            await turn_context.send_activity(
+                "A vault refresh is running right now; try again once it finishes (or /stopsync it first)."
+            )
+            return
+        if result.status == "already_running":
+            await turn_context.send_activity("Another maintenance job is already running. Here’s its status:")
+
+        record = result.progress or {
+            "status": "queued",
+            "phase": "queued",
+            "job_id": result.job_id,
+            "job_type": job_type,
+        }
+        record.setdefault("job_type", job_type)
+        card = build_admin_job_card(record)
+
+        activity_id = replace_activity_id
+        if activity_id:
+            await self._update_activity_card(turn_context, card, activity_id=activity_id)
+        else:
+            response = await turn_context.send_activity(Activity(type=ActivityTypes.message, attachments=[card]))
+            activity_id = getattr(response, "id", None)
+
+        if activity_id and result.job_id:
+            self._sync_monitor.start(
+                job_id=result.job_id,
+                adapter=turn_context.adapter,
+                app_id=self._settings.app_id,
+                conversation_reference=TurnContext.get_conversation_reference(turn_context.activity),
+                activity_id=activity_id,
+                fetch_status=self._ingest_admin_client.get_admin_job_status,
+                build_card=build_admin_job_card,
+            )
+
+    async def _handle_admin_confirmation(self, turn_context: TurnContext) -> None:
+        value = turn_context.activity.value or {}
+        action_kind = value.get("action")
+        token = str(value.get("token") or "")
+        pending = self._pending_actions.pop(token)
+        if pending is None:
+            await turn_context.send_activity(
+                "This confirmation expired or was already handled. Run the command again if you still need it."
+            )
+            return
+
+        aad, name = self._sender_identity(turn_context)
+        if not self._is_admin(turn_context) or (aad or "") != pending.initiator_aad_object_id:
+            # Only the original admin may resolve their own pending action.
+            self._pending_actions.put_back(pending)
+            await turn_context.send_activity(
+                f"Only {pending.initiator_name or 'the requester'} can confirm or cancel this action."
+            )
+            return
+
+        preview_activity_id = pending.payload.get("preview_activity_id")
+        if action_kind == "admin_cancel":
+            await self._update_activity_card(
+                turn_context,
+                build_admin_result_card("Cancelled", f"Cancelled by {name or 'admin'}.", tone="warning"),
+                activity_id=preview_activity_id,
+            )
+            return
+
+        payload = {"path": pending.payload["path"]} if pending.command == "remove" else {}
+        await self._submit_admin_job(
+            turn_context,
+            job_type=pending.command,
+            payload=payload,
+            replace_activity_id=preview_activity_id,
+        )
+
+    async def _update_activity_card(
+        self,
+        turn_context: TurnContext,
+        card: Attachment,
+        *,
+        activity_id: str | None = None,
+    ) -> None:
+        target_id = activity_id or turn_context.activity.reply_to_id
+        if not target_id:
+            await turn_context.send_activity(Activity(type=ActivityTypes.message, attachments=[card]))
+            return
+        activity = Activity(id=target_id, type=ActivityTypes.message, attachments=[card])
+        try:
+            await turn_context.update_activity(activity)
+        except Exception:
+            LOGGER.warning("Failed to update card in place; sending a new one", exc_info=True)
+            await turn_context.send_activity(Activity(type=ActivityTypes.message, attachments=[card]))
 
     async def _typing_loop(self, turn_context: TurnContext, interval_seconds: float = 3.0) -> None:
         """Send repeated typing indicators until the current operation completes."""

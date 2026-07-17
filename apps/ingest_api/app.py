@@ -13,7 +13,15 @@ from aiohttp import web
 from packages.contracts.sync import SourceFileEvent, SyncJobAccepted, SyncJobMessage
 from packages.shared.documents.extract_text import SUPPORTED_EXTENSIONS
 from packages.shared.messaging.service_bus import send_json_message
-from packages.wiki_core.ingest.progress import is_stale, read_progress, write_queued
+from packages.wiki_core.ingest.progress import (
+    TERMINAL_STATUSES,
+    cancel_requested_for,
+    is_stale,
+    read_progress,
+    write_cancel,
+    write_cancelled_from,
+    write_queued,
+)
 from packages.wiki_core.ingest.sharepoint_adapter import SharePointSourceSyncAdapter
 from packages.wiki_core.ingest.subscription_manager import SubscriptionManager
 from packages.wiki_core.settings import CoreSettings
@@ -76,7 +84,63 @@ def create_app() -> web.Application:
         record = read_progress(core_settings.sync_progress_path)
         if record is None:
             return web.json_response({"status": "none"})
+        # Surface a pending cancel immediately (before the worker's next heartbeat)
+        # so the progress card can show "Stopping…" within one poll tick. Never
+        # persisted — added only to the served copy to avoid a write race.
+        if record.get("status") not in TERMINAL_STATUSES and cancel_requested_for(
+            core_settings.sync_cancel_path, str(record.get("job_id") or "")
+        ):
+            record = {**record, "cancel_requested": True}
         return web.json_response(record)
+
+    async def cancel_sync(request: web.Request) -> web.Response:
+        body: dict = {}
+        try:
+            parsed = await request.json()
+            if isinstance(parsed, dict):
+                body = parsed
+        except (json.JSONDecodeError, ValueError):
+            body = {}
+        requested_by_user_name = (
+            str(body.get("requested_by_user_name")) if body.get("requested_by_user_name") is not None else None
+        )
+
+        record = read_progress(core_settings.sync_progress_path)
+        if record is None or record.get("status") in TERMINAL_STATUSES:
+            return web.json_response({"error": "No sync is currently queued or running."}, status=404)
+
+        job_id = str(record.get("job_id") or "")
+
+        if is_stale(record):
+            # The worker stopped heart-beating and will never write a terminal
+            # record, so correct the status in place to keep the card truthful.
+            # Also drop a sentinel in case the worker is alive-but-slow.
+            updated = write_cancelled_from(
+                core_settings.sync_progress_path,
+                record,
+                error="Cancelled while stalled (no worker heartbeat).",
+            )
+            if job_id:
+                write_cancel(
+                    core_settings.sync_cancel_path,
+                    job_id=job_id,
+                    requested_by_user_name=requested_by_user_name,
+                )
+            return web.json_response(
+                {"job_id": job_id, "status": "cancelled_stale", "progress": updated}, status=200
+            )
+
+        # Active and healthy: request a cooperative stop; the worker finishes the
+        # in-flight file, writes a terminal "cancelled" record, and completes the
+        # queue message. Idempotent — a repeat request just rewrites the sentinel.
+        write_cancel(
+            core_settings.sync_cancel_path,
+            job_id=job_id,
+            requested_by_user_name=requested_by_user_name,
+        )
+        return web.json_response(
+            {"job_id": job_id, "status": "cancel_requested", "progress": record}, status=202
+        )
 
     async def manual_sync(request: web.Request) -> web.Response:
         if request.content_type != "application/json":
@@ -120,6 +184,64 @@ def create_app() -> web.Application:
             )
         except OSError:
             LOGGER.warning("Failed to write initial queued sync-progress record", exc_info=True)
+        return web.json_response({"job_id": accepted.job_id, "status": accepted.status}, status=202)
+
+    async def admin_job_status(_: web.Request) -> web.Response:
+        record = read_progress(core_settings.admin_job_progress_path)
+        if record is None:
+            return web.json_response({"status": "none"})
+        return web.json_response(record)
+
+    async def submit_admin_job(request: web.Request) -> web.Response:
+        if request.content_type != "application/json":
+            return web.json_response({"error": "Only application/json payloads are supported."}, status=415)
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            return web.json_response({"error": "Malformed JSON payload."}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "Job payload must be a JSON object."}, status=400)
+
+        job_type = str(body.get("job_type") or "").strip()
+        if job_type not in {"remove", "clean", "lint"}:
+            return web.json_response({"error": f"Unsupported admin job type: {job_type!r}"}, status=400)
+
+        # One admin job at a time (same gate shape as manual_sync).
+        current = read_progress(core_settings.admin_job_progress_path)
+        if current and current.get("status") in {"queued", "running"} and not is_stale(current):
+            return web.json_response({"status": "already_running", "progress": current}, status=409)
+
+        # Mutating jobs must not silently queue behind an hours-long sync; tell the
+        # caller instead so they can retry after it finishes.
+        if job_type in {"remove", "clean"}:
+            sync = read_progress(core_settings.sync_progress_path)
+            if sync and sync.get("status") == "running" and not is_stale(sync):
+                return web.json_response({"status": "sync_running", "progress": sync}, status=409)
+
+        requested_by_user_name = (
+            str(body.get("requested_by_user_name")) if body.get("requested_by_user_name") is not None else None
+        )
+        payload = body.get("payload") if isinstance(body.get("payload"), dict) else {}
+        accepted = _queue_job(
+            settings,
+            SyncJobMessage(
+                job_id=uuid.uuid4().hex,
+                job_type=job_type,
+                payload=payload,
+                requested_by_user_id=(str(body.get("requested_by_user_id")) if body.get("requested_by_user_id") is not None else None),
+                requested_by_user_name=requested_by_user_name,
+                source=f"teams-admin-{job_type}",
+            ),
+        )
+        try:
+            write_queued(
+                core_settings.admin_job_progress_path,
+                job_id=accepted.job_id,
+                job_type=job_type,
+                requested_by_user_name=requested_by_user_name,
+            )
+        except OSError:
+            LOGGER.warning("Failed to write initial queued admin-job record", exc_info=True)
         return web.json_response({"job_id": accepted.job_id, "status": accepted.status}, status=202)
 
     async def sharepoint_webhook(request: web.Request) -> web.Response:
@@ -179,6 +301,9 @@ def create_app() -> web.Application:
     app.router.add_get("/healthz", healthcheck)
     app.router.add_post("/admin/sync", manual_sync)
     app.router.add_get("/admin/sync/status", sync_status)
+    app.router.add_post("/admin/sync/cancel", cancel_sync)
+    app.router.add_post("/admin/jobs", submit_admin_job)
+    app.router.add_get("/admin/jobs/status", admin_job_status)
     app.router.add_post("/api/webhooks/sharepoint", sharepoint_webhook)
     app.cleanup_ctx.append(_subscription_loop)
     app["settings"] = settings

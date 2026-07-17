@@ -256,6 +256,28 @@ class SharePointSourceSyncAdapter:
         remote_path = self._remote_wiki_path(relative_path)
         self._upload_bytes(remote_path=remote_path, payload=content.encode("utf-8"), content_type="text/markdown; charset=utf-8")
 
+    def delete_file(self, remote_path: str) -> bool:
+        """DELETE the drive item at ``remote_path``. Returns False if already gone (404).
+
+        Structurally refuses to touch anything under the immutable raw/sources
+        root — the delete API must never be able to remove a source of truth.
+        """
+        normalized = remote_path.strip("/")
+        raw_root = self._settings.normalized_sharepoint_raw_root_path
+        if normalized == raw_root or normalized.startswith(raw_root + "/"):
+            raise ValueError(f"Refusing to delete an immutable raw source path: {remote_path!r}")
+
+        with httpx.Client(timeout=self._timeout, headers=self._authorized_headers()) as client:
+            response = client.delete(self._graph_drive_item_url(normalized))
+            if response.status_code == 404:
+                return False
+            response.raise_for_status()
+            return True
+
+    def delete_wiki_file(self, relative_path: str) -> bool:
+        """Delete a ``wiki/...`` page from SharePoint. Returns False if already gone."""
+        return self.delete_file(self._remote_wiki_path(relative_path))
+
     def ensure_remote_folder(self, remote_path: str) -> None:
         segments = [segment for segment in remote_path.strip("/").split("/") if segment]
         if not segments:
