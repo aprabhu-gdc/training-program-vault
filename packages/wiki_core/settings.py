@@ -100,6 +100,11 @@ class CoreSettings:
     analytics_enabled: bool = True
     analytics_query_list_name: str = "TrainingBotQueryEvents"
     analytics_feedback_list_name: str = "TrainingBotFeedback"
+    # Ingest LLM (wiki-page generation). Defaulted: falls back to the chat
+    # provider/model, so setting LLM_INGEST_MODEL alone upgrades ingest without
+    # touching the interactive answering path.
+    llm_ingest_provider: str = ""
+    llm_ingest_model: str = ""
 
     @classmethod
     def from_env(cls) -> "CoreSettings":
@@ -189,6 +194,8 @@ class CoreSettings:
             analytics_feedback_list_name=_read_env(
                 "ANALYTICS_FEEDBACK_LIST_NAME", default="TrainingBotFeedback"
             ),
+            llm_ingest_provider=_read_env("LLM_INGEST_PROVIDER"),
+            llm_ingest_model=_read_env("LLM_INGEST_MODEL"),
         )
 
     @property
@@ -208,8 +215,16 @@ class CoreSettings:
         return _normalize_provider(self.llm_embedding_provider or self.llm_provider or self.llm_chat_provider)
 
     @property
+    def ingest_provider(self) -> str:
+        return _normalize_provider(self.llm_ingest_provider or self.llm_chat_provider or self.llm_provider)
+
+    @property
     def resolved_chat_model(self) -> str:
         return self.llm_chat_model.strip()
+
+    @property
+    def resolved_ingest_model(self) -> str:
+        return (self.llm_ingest_model or self.llm_chat_model).strip()
 
     @property
     def resolved_vision_model(self) -> str:
@@ -266,6 +281,7 @@ class CoreSettings:
             ("chat", self.chat_provider),
             ("vision", self.vision_provider or self.chat_provider),
             ("embedding", self.embedding_provider),
+            ("ingest", self.ingest_provider),
         ):
             self._validate_provider(capability=capability, provider=provider)
 

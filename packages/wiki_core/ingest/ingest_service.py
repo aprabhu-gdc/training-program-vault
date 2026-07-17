@@ -5,12 +5,16 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, NamedTuple
 
-from packages.shared.documents.extract_text import SUPPORTED_EXTENSIONS, extract_text
+from packages.shared.documents.extract_text import (
+    CONVERTIBLE_EXTENSIONS,
+    SUPPORTED_EXTENSIONS,
+    extract_text,
+)
 from packages.wiki_core.ai.legacy_provider_gateway import LegacyProviderGateway
 from packages.wiki_core.content.file_page_store import FilePageStore
 from packages.wiki_core.content.markdown import slugify
@@ -22,6 +26,16 @@ from packages.wiki_core.settings import CoreSettings
 LOGGER = logging.getLogger(__name__)
 
 
+# Enumerated source files we know how to turn into wiki pages: parsed locally,
+# or converted to PDF by Graph on download (legacy .doc).
+INGESTIBLE_EXTENSIONS = SUPPORTED_EXTENSIONS | CONVERTIBLE_EXTENSIONS
+
+
+class IngestFileResult(NamedTuple):
+    updated_paths: list[str]
+    empty: bool
+
+
 @dataclass(frozen=True)
 class SyncReport:
     requested_files: int
@@ -29,6 +43,11 @@ class SyncReport:
     updated_wiki_files: list[str]
     skipped_files: list[str]
     index_report: IndexingReport
+    # Per-file outcomes surfaced to users via wiki/reports/last-sync.md. Defaulted
+    # so existing construction sites (tests) keep working unchanged.
+    failed_files: list[dict[str, str]] = field(default_factory=list)
+    empty_extraction_files: list[str] = field(default_factory=list)
+    unsupported_files: dict[str, int] = field(default_factory=dict)
 
     @property
     def updated_count(self) -> int:
@@ -50,19 +69,26 @@ class AutoIngestService:
         events = [
             event
             for event in self._source_sync.parse_webhook_payload(payload)
-            if self._source_sync.is_in_scope(event) and Path(event.path).suffix.lower() in SUPPORTED_EXTENSIONS
+            if self._source_sync.is_in_scope(event) and Path(event.path).suffix.lower() in INGESTIBLE_EXTENSIONS
         ]
         return self.sync_events(events)
 
     def sync_all_training_files(self) -> SyncReport:
         self._refresh_local_wiki_from_sharepoint()
         folder_path = self._settings.normalized_sharepoint_raw_root_path
-        events = [
-            event
-            for event in self._source_sync.list_files_recursive(folder_path)
-            if Path(event.path).suffix.lower() in SUPPORTED_EXTENSIONS
-        ]
-        report = self.sync_events(events, download_missing=True)
+        all_files = self._source_sync.list_files_recursive(folder_path)
+        events = [event for event in all_files if Path(event.path).suffix.lower() in INGESTIBLE_EXTENSIONS]
+
+        # Tally files we skip for lack of an extractor so the sync report can tell
+        # users exactly which sources are not being ingested (and why).
+        unsupported_files: dict[str, int] = {}
+        for event in all_files:
+            suffix = Path(event.path).suffix.lower()
+            if suffix not in INGESTIBLE_EXTENSIONS:
+                key = suffix or "(no extension)"
+                unsupported_files[key] = unsupported_files.get(key, 0) + 1
+
+        report = self.sync_events(events, download_missing=True, unsupported_files=unsupported_files)
 
         # The per-file upsert above only indexes LLM-regenerated pages. Pages
         # pulled from SharePoint by _refresh_local_wiki_from_sharepoint (and any
@@ -74,14 +100,24 @@ class AutoIngestService:
         except Exception:
             LOGGER.exception("Index reconcile after full sync failed; targeted upsert results stand")
 
+        self._publish_sync_report(report)
         return report
 
-    def sync_events(self, events: Iterable[Any], *, download_missing: bool = True) -> SyncReport:
+    def sync_events(
+        self,
+        events: Iterable[Any],
+        *,
+        download_missing: bool = True,
+        unsupported_files: dict[str, int] | None = None,
+    ) -> SyncReport:
         events = list(events)
         state = self._load_state()
         downloaded_files: list[str] = []
         updated_wiki_files: list[str] = []
         skipped_files: list[str] = []
+        failed_files: list[dict[str, str]] = []
+        empty_extraction_files: list[str] = []
+        processed_state: dict[str, str] = {}
 
         for event in events:
             event_key = self._event_key(event)
@@ -89,37 +125,58 @@ class AutoIngestService:
                 skipped_files.append(event.path)
                 continue
 
-            local_path = self._settings.raw_sources_root / self._relative_from_event(event)
-            if download_missing:
-                local_path = self._source_sync.download_file(event.path)
-            elif not local_path.exists():
-                skipped_files.append(event.path)
+            # Fail-soft: one unreadable source (corrupt PDF, Graph download error,
+            # LLM returning invalid JSON) must not abort the whole sync and strand
+            # every other file. Record it and move on; it retries next sync because
+            # its fingerprint is never written to state.
+            try:
+                local_path = self._settings.raw_sources_root / self._relative_from_event(event)
+                if download_missing:
+                    local_path = self._source_sync.download_file(event.path)
+                elif not local_path.exists():
+                    skipped_files.append(event.path)
+                    continue
+
+                result = self._ingest_local_file(local_path)
+            except Exception as exc:
+                LOGGER.exception("Ingest failed for source file path=%s", event.path)
+                failed_files.append({"path": event.path, "error": f"{type(exc).__name__}: {exc}"})
                 continue
 
-            wiki_updates = self._ingest_local_file(local_path)
             downloaded_files.append(event.path)
-            updated_wiki_files.extend(wiki_updates)
+            updated_wiki_files.extend(result.updated_paths)
+            if result.empty:
+                empty_extraction_files.append(event.path)
             if event_key:
-                state[event.path] = event_key
+                processed_state[event.path] = event_key
 
-        self._save_state(state)
-        changed_paths = [self._settings.repo_root / path for path in sorted(set(updated_wiki_files))]
-        self._publish_changed_wiki_files(changed_relative_paths=sorted(set(updated_wiki_files)))
+        changed_relative = sorted(set(updated_wiki_files))
+        changed_paths = [self._settings.repo_root / path for path in changed_relative]
+        # Publish + index BEFORE recording state, so a file is only marked
+        # processed once its wiki output is durable on SharePoint and in the index.
+        # A crash between here and _save_state just re-does idempotent work.
+        self._publish_changed_wiki_files(changed_relative_paths=changed_relative)
         index_report = self._indexer.upsert_modified_files(changed_paths=changed_paths)
+
+        state.update(processed_state)
+        self._save_state(state)
 
         return SyncReport(
             requested_files=len(events),
             downloaded_files=downloaded_files,
-            updated_wiki_files=sorted(set(updated_wiki_files)),
+            updated_wiki_files=changed_relative,
             skipped_files=skipped_files,
             index_report=index_report,
+            failed_files=failed_files,
+            empty_extraction_files=empty_extraction_files,
+            unsupported_files=dict(unsupported_files or {}),
         )
 
-    def _ingest_local_file(self, raw_path: Path) -> list[str]:
+    def _ingest_local_file(self, raw_path: Path) -> IngestFileResult:
         text = extract_text(raw_path).strip()
         if not text:
             LOGGER.warning("Skipping empty extracted file path=%s", raw_path)
-            return []
+            return IngestFileResult(updated_paths=[], empty=True)
 
         relative_raw_path = raw_path.relative_to(self._settings.repo_root).as_posix()
         generated = self._generate_ingest_payload(raw_path=raw_path, relative_raw_path=relative_raw_path, text=text)
@@ -154,7 +211,7 @@ class AutoIngestService:
         if self._page_store.append_ingest_log_entry(raw_path=relative_raw_path, generated=generated, updated_paths=updated_paths):
             updated_paths.append("wiki/log.md")
 
-        return sorted(set(updated_paths))
+        return IngestFileResult(updated_paths=sorted(set(updated_paths)), empty=False)
 
     def _generate_ingest_payload(self, *, raw_path: Path, relative_raw_path: str, text: str) -> dict[str, Any]:
         today = datetime.now(UTC).date().isoformat()
@@ -258,6 +315,62 @@ class AutoIngestService:
                 continue
             self._source_sync.upload_text_file(relative_path, local_path.read_text(encoding="utf-8"))
 
+    def _publish_sync_report(self, report: SyncReport) -> None:
+        """Write a human-readable sync report to wiki/reports/last-sync.md and
+        publish it to SharePoint so users can see exactly what happened —
+        including which files failed or were skipped and why. Fail-soft: a report
+        problem must never mask an otherwise successful sync.
+
+        The report contains only file paths and error classes — never config or
+        secret values (org data-security policy).
+        """
+
+        try:
+            generated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+            lines: list[str] = [
+                "# Last sync report",
+                "",
+                f"- Generated: {generated_at}",
+                f"- Source files considered: {report.requested_files}",
+                f"- Ingested (new/changed): {len(report.downloaded_files)}",
+                f"- Skipped (unchanged): {len(report.skipped_files)}",
+                f"- Wiki pages updated: {len(report.updated_wiki_files)}",
+                f"- Indexed pages: {len(report.index_report.indexed_files)}",
+                f"- Failed: {len(report.failed_files)}",
+                f"- Empty (no extractable text): {len(report.empty_extraction_files)}",
+                "",
+            ]
+
+            if report.failed_files:
+                lines.append("## Failed files")
+                lines.append("")
+                for entry in report.failed_files:
+                    lines.append(f"- `{entry.get('path', '')}` — {entry.get('error', 'unknown error')}")
+                lines.append("")
+
+            if report.empty_extraction_files:
+                lines.append("## Empty extractions (likely scanned images — need OCR)")
+                lines.append("")
+                for path in report.empty_extraction_files:
+                    lines.append(f"- `{path}`")
+                lines.append("")
+
+            if report.unsupported_files:
+                lines.append("## Unsupported file types (not ingested)")
+                lines.append("")
+                for suffix, count in sorted(report.unsupported_files.items()):
+                    lines.append(f"- `{suffix}`: {count}")
+                lines.append("")
+
+            content = "\n".join(lines)
+            relative_path = "wiki/reports/last-sync.md"
+            local_path = self._settings.wiki_root / "reports" / "last-sync.md"
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_text(content, encoding="utf-8")
+            self._source_sync.upload_text_file(relative_path, content)
+        except Exception:
+            LOGGER.exception("Failed to publish sync report; sync results are unaffected")
+
     def _refresh_local_wiki_from_sharepoint(self) -> None:
         wiki_root = self._settings.normalized_sharepoint_wiki_root_path
         remote_events = self._source_sync.list_files_recursive(wiki_root)
@@ -289,11 +402,13 @@ def main() -> int:
         parser.error("Choose --manual.")
 
     LOGGER.info(
-        "Sync complete requested=%s downloaded=%s updated_wiki=%s indexed=%s deleted=%s",
+        "Sync complete requested=%s downloaded=%s updated_wiki=%s indexed=%s deleted=%s failed=%s empty=%s",
         report.requested_files,
         len(report.downloaded_files),
         len(report.updated_wiki_files),
         len(report.index_report.indexed_files),
         len(report.index_report.deleted_files),
+        len(report.failed_files),
+        len(report.empty_extraction_files),
     )
     return 0

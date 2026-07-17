@@ -12,6 +12,11 @@ from pptx import Presentation
 
 SUPPORTED_EXTENSIONS = {".docx", ".pdf", ".pptx", ".xlsx", ".xlsm"}
 
+# Legacy formats we cannot parse locally but Microsoft Graph can convert to PDF
+# at download time (`GET .../content?format=pdf`). Kept separate so the local
+# extraction contract above stays honest.
+CONVERTIBLE_EXTENSIONS = {".doc"}
+
 
 def extract_docx(path: Path) -> str:
     doc = Document(path)

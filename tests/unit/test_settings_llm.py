@@ -120,3 +120,27 @@ def test_validate_llm_rejects_removed_providers(tmp_path, bad):
     s = make_core_settings(tmp_path, llm_provider=bad)
     with pytest.raises(ValueError, match="Unsupported|not implemented"):
         s.validate_llm()
+
+
+def test_ingest_model_falls_back_to_chat_model_when_unset(tmp_path):
+    s = make_core_settings(tmp_path, llm_chat_model="gpt-chat", llm_ingest_model="")
+    assert s.resolved_ingest_model == "gpt-chat"
+
+
+def test_ingest_model_overrides_chat_model_when_set(tmp_path):
+    s = make_core_settings(tmp_path, llm_chat_model="gpt-chat", llm_ingest_model="gpt-5.4-mini")
+    assert s.resolved_ingest_model == "gpt-5.4-mini"
+
+
+def test_ingest_provider_falls_back_to_chat_then_llm_provider(tmp_path):
+    s = make_core_settings(tmp_path, llm_provider="openai", llm_chat_provider="", llm_ingest_provider="")
+    assert s.ingest_provider == "openai"
+
+    s2 = make_core_settings(tmp_path, llm_provider="openai", llm_ingest_provider="azure")
+    assert s2.ingest_provider == "azure-openai"
+
+
+def test_validate_llm_rejects_bad_ingest_provider(tmp_path):
+    s = make_core_settings(tmp_path, llm_ingest_provider="anthropic")
+    with pytest.raises(ValueError, match="Unsupported|not implemented"):
+        s.validate_llm()

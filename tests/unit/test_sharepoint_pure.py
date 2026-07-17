@@ -92,3 +92,42 @@ def test_remote_wiki_path(adapter, relative, expected):
 def test_format_expiration_shape(adapter):
     value = adapter._format_expiration(60)
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.0000000Z", value)
+
+
+def test_download_file_converts_legacy_doc_to_pdf(adapter):
+    """Legacy .doc is fetched as PDF (Graph server-side conversion) and lands at
+    a .pdf destination so a local PDF extractor can read it."""
+
+    captured = {}
+
+    def fake_download(remote_path, destination, *, convert_to_pdf=False):
+        captured["remote_path"] = remote_path
+        captured["destination"] = destination
+        captured["convert_to_pdf"] = convert_to_pdf
+        return destination
+
+    adapter.download_remote_file = fake_download  # type: ignore[method-assign]
+    result = adapter.download_file("raw/sources/Paint/Macropoxy 920.doc")
+
+    assert captured["convert_to_pdf"] is True
+    assert result.name == "Macropoxy 920.doc.pdf"
+    assert result.suffix == ".pdf"
+
+
+def test_download_file_leaves_supported_types_untouched(adapter):
+    captured = {}
+
+    def fake_download(remote_path, destination, *, convert_to_pdf=False):
+        captured["convert_to_pdf"] = convert_to_pdf
+        return destination
+
+    adapter.download_remote_file = fake_download  # type: ignore[method-assign]
+    result = adapter.download_file("raw/sources/topic.pdf")
+
+    assert captured["convert_to_pdf"] is False
+    assert result.name == "topic.pdf"
+
+
+def test_content_url_format_pdf_suffix(adapter):
+    base = adapter._graph_item_content_url("raw/sources/x.doc")
+    assert (base + "?format=pdf").endswith("/root:/raw/sources/x.doc:/content?format=pdf")
