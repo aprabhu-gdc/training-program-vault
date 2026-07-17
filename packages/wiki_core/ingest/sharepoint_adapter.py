@@ -11,6 +11,7 @@ from urllib.parse import quote
 import httpx
 
 from packages.contracts.sync import SourceFileEvent
+from packages.shared.documents.extract_text import CONVERTIBLE_EXTENSIONS
 from packages.wiki_core.settings import CoreSettings
 
 
@@ -190,12 +191,19 @@ class SharePointSourceSyncAdapter:
     def download_file(self, path: str) -> Path:
         relative = self._relative_raw_path(path)
         destination = self._settings.raw_sources_root / relative
+        if Path(path).suffix.lower() in CONVERTIBLE_EXTENSIONS:
+            # Graph converts legacy formats to PDF server-side; keep the original
+            # name and append .pdf so provenance stays visible on disk.
+            destination = destination.with_name(destination.name + ".pdf")
+            return self.download_remote_file(path, destination, convert_to_pdf=True)
         return self.download_remote_file(path, destination)
 
-    def download_remote_file(self, remote_path: str, destination: Path) -> Path:
+    def download_remote_file(self, remote_path: str, destination: Path, *, convert_to_pdf: bool = False) -> Path:
         destination.parent.mkdir(parents=True, exist_ok=True)
 
         download_url = self._graph_item_content_url(remote_path)
+        if convert_to_pdf:
+            download_url += "?format=pdf"
         LOGGER.info("Downloading SharePoint file path=%s destination=%s", remote_path, destination)
         with httpx.Client(timeout=self._timeout, headers=self._authorized_headers(), follow_redirects=True) as client:
             with client.stream("GET", download_url) as response:

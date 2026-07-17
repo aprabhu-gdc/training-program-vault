@@ -19,7 +19,10 @@
 #   INGEST_API_PORT=8010   (MUST be set; ingest config otherwise falls back to
 #                           PORT and would collide with the bot)
 #   INGEST_ADMIN_HTTP_URL=http://localhost:8010
-#   WIKI_QUERY_CALLABLE=rag_backend.query:query_vault
+#   WIKI_QUERY_CALLABLE=rag_backend.query:query_vault_structured
+#                          (the _structured variant is required: it returns
+#                           citations + retrieval diagnostics used for concept
+#                           analytics; plain query_vault yields "Unknown" rows)
 #   MicrosoftAppId / MicrosoftAppPassword / MicrosoftAppType=SingleTenant /
 #   MicrosoftAppTenantId
 #   ...plus all existing LLM / SharePoint / Service Bus settings.

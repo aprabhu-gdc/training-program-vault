@@ -15,7 +15,15 @@ class FilePageStore:
         self._settings = settings or CoreSettings.from_env()
 
     def iter_wiki_pages(self) -> list[Path]:
-        return [path for path in iter_wiki_markdown_files(self._settings.wiki_root)]
+        # wiki/reports/ holds operational sync reports (see AutoIngestService).
+        # They are published to SharePoint for humans but must never be embedded
+        # into the retrieval index.
+        reports_root = self._settings.wiki_root / "reports"
+        return [
+            path
+            for path in iter_wiki_markdown_files(self._settings.wiki_root)
+            if reports_root not in path.parents
+        ]
 
     def load_wiki_page(self, path: Path):
         return load_wiki_page(path, self._settings.repo_root)

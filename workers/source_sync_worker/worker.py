@@ -8,7 +8,7 @@ import time
 from typing import Any
 
 from packages.contracts.sync import SourceFileEvent
-from packages.shared.documents.extract_text import SUPPORTED_EXTENSIONS
+from packages.shared.documents.extract_text import CONVERTIBLE_EXTENSIONS, SUPPORTED_EXTENSIONS
 from packages.shared.logging import configure_logging
 from packages.shared.messaging.service_bus import process_queue_messages
 from packages.wiki_core.ingest.ingest_service import AutoIngestService
@@ -68,7 +68,7 @@ def _process_job(payload: dict[str, Any], service: AutoIngestService) -> None:
         suffix = ""
         if "." in path:
             suffix = "." + path.rsplit(".", maxsplit=1)[1].lower()
-        if suffix not in SUPPORTED_EXTENSIONS:
+        if suffix not in SUPPORTED_EXTENSIONS and suffix not in CONVERTIBLE_EXTENSIONS:
             LOGGER.info("Skipping webhook job for unsupported extension job_id=%s path=%s", job_id, path)
             processed_job_ids.add(job_id)
             _save_processed_jobs(service, processed_job_ids)
@@ -106,6 +106,10 @@ def _poll_once(settings: WorkerSettings, service: AutoIngestService) -> int:
             processor=lambda payload: _process_job(payload, service),
             max_message_count=1,
             max_wait_time=5,
+            # A full manual sync of the whole vault runs an LLM call per file and
+            # can take hours; keep the message lock alive well past the 1h default
+            # so a long-but-healthy sync isn't abandoned and redelivered mid-run.
+            max_lock_renewal_duration=6 * 3600,
             treat_completion_lock_loss_as_processed=True,
         )
     except Exception:

@@ -38,3 +38,5 @@ wiki/index.md
 # Local source-sync runtime state (defaults under LOCAL_DATA_ROOT; safety net)
 source-sync-state.json
 sync-job-state.json
+
+images/
