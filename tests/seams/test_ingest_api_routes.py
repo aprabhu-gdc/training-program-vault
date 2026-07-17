@@ -106,3 +106,58 @@ async def test_admin_sync_rejects_non_json(queued):
     async with TestClient(TestServer(app)) as client:
         resp = await client.post("/admin/sync", data="x", headers={"Content-Type": "text/plain"})
         assert resp.status == 415
+
+
+async def test_sync_status_none_when_no_job(queued):
+    app = ingest_app.create_app()
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/admin/sync/status")
+        assert resp.status == 200
+        assert (await resp.json())["status"] == "none"
+
+
+async def test_admin_sync_writes_queued_status_then_status_endpoint_reports_it(queued):
+    app = ingest_app.create_app()
+    async with TestClient(TestServer(app)) as client:
+        await client.post("/admin/sync", json={"requested_by_user_name": "Dana"})
+        status = await (await client.get("/admin/sync/status")).json()
+        assert status["status"] == "queued"
+        assert status["requested_by_user_name"] == "Dana"
+
+
+async def test_admin_sync_409_when_fresh_job_in_flight(queued, tmp_path):
+    from packages.wiki_core.ingest.progress import FileProgressReporter
+
+    reporter = FileProgressReporter(
+        tmp_path / "sync-progress.json", job_id="live", job_type="manual", requested_by_user_name="Ravi"
+    )
+    reporter.start()  # status=running, fresh heartbeat
+
+    app = ingest_app.create_app()
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/admin/sync", json={"requested_by_user_name": "Dana"})
+        assert resp.status == 409
+        body = await resp.json()
+        assert body["status"] == "already_running"
+        assert body["progress"]["job_id"] == "live"
+    # No new job was enqueued.
+    assert queued == []
+
+
+async def test_admin_sync_202_when_prior_job_is_stale(queued, tmp_path):
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    stale = {
+        "job_id": "old",
+        "status": "running",
+        "phase": "processing",
+        "updated_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat(),
+    }
+    (tmp_path / "sync-progress.json").write_text(json.dumps(stale), encoding="utf-8")
+
+    app = ingest_app.create_app()
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/admin/sync", json={"requested_by_user_name": "Dana"})
+        assert resp.status == 202
+    assert len(queued) == 1

@@ -66,6 +66,7 @@ class CoreSettings:
     vector_manifest_path: Path
     source_sync_state_path: Path
     sync_job_state_path: Path
+    sync_progress_path: Path
     rag_top_k: int
     rag_index_summary_chars: int
     max_source_chars: int
@@ -129,6 +130,10 @@ class CoreSettings:
             _read_env("SYNC_JOB_STATE_PATH", default=str(local_data_root / "sync-job-state.json")),
             base=local_data_root,
         )
+        sync_progress_path = _resolve_path(
+            _read_env("SYNC_PROGRESS_PATH", default=str(local_data_root / "sync-progress.json")),
+            base=local_data_root,
+        )
 
         return cls(
             repo_root=repo_root,
@@ -139,6 +144,7 @@ class CoreSettings:
             vector_manifest_path=vector_manifest_path,
             source_sync_state_path=source_sync_state_path,
             sync_job_state_path=sync_job_state_path,
+            sync_progress_path=sync_progress_path,
             rag_top_k=int(_read_env("RAG_TOP_K", default="6")),
             rag_index_summary_chars=int(_read_env("RAG_INDEX_SUMMARY_CHARS", default="5000")),
             max_source_chars=int(_read_env("AUTO_INGEST_MAX_SOURCE_CHARS", default="18000")),
@@ -266,6 +272,7 @@ class CoreSettings:
         self.vector_manifest_path.parent.mkdir(parents=True, exist_ok=True)
         self.source_sync_state_path.parent.mkdir(parents=True, exist_ok=True)
         self.sync_job_state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.sync_progress_path.parent.mkdir(parents=True, exist_ok=True)
 
     def validate_llm(self) -> None:
         if not self.chat_provider:

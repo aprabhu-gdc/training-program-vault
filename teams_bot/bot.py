@@ -22,13 +22,14 @@ from botbuilder.schema import Activity, ActivityTypes, Attachment, InvokeRespons
 from packages.contracts.identity import CallerIdentity
 from packages.contracts.query import QueryAttachment, QueryRequest
 from packages.shared.documents.extract_text import SUPPORTED_EXTENSIONS, extract_text
-from teams_bot.cards import build_answer_card
+from teams_bot.cards import build_answer_card, build_sync_progress_card
 from teams_bot.config import Settings
 from teams_bot.services.analytics import AnalyticsService, ConceptMapResolver, derive_concept
 from teams_bot.services.concept_labels import concept_label
 from teams_bot.services.feedback import FeedbackEvent, FeedbackLogger
 from teams_bot.services.ingest_admin_client import HttpIngestAdminClient
 from teams_bot.services.source_links import SourceLinkResolver
+from teams_bot.services.sync_monitor import SyncProgressMonitor
 from teams_bot.services.wiki_query import (
     WikiIntegrationError,
     WikiQueryService,
@@ -52,6 +53,7 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         ingest_admin_client: HttpIngestAdminClient,
         analytics: AnalyticsService | None = None,
         concept_map: ConceptMapResolver | None = None,
+        sync_monitor: SyncProgressMonitor | None = None,
     ) -> None:
         super().__init__()
         self._settings = settings
@@ -60,6 +62,7 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         self._wiki_query_service = wiki_query_service
         self._feedback_logger = feedback_logger
         self._ingest_admin_client = ingest_admin_client
+        self._sync_monitor = sync_monitor or SyncProgressMonitor(ingest_admin_client)
         self._analytics = analytics or AnalyticsService()
         self._concept_map = concept_map or ConceptMapResolver()
         # Strong references keep fire-and-forget analytics tasks alive until done.
@@ -361,17 +364,21 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         task.add_done_callback(_done)
 
     async def _handle_sync_command(self, turn_context: TurnContext) -> None:
-        """Trigger a manual SharePoint sync instead of querying the RAG pipeline."""
+        """Trigger a manual SharePoint sync and post a live-updating progress card.
 
-        await turn_context.send_activity("Refreshing the training vault from SharePoint. I’ll post the result here when it finishes.")
+        The sync itself runs in a separate worker process, so a background monitor
+        polls its status and redraws the card in place until the sync finishes.
+        """
+
+        user_name = (
+            turn_context.activity.from_property.name if turn_context.activity.from_property else None
+        )
         try:
-            accepted = await self._ingest_admin_client.request_manual_sync(
+            result = await self._ingest_admin_client.request_manual_sync(
                 requested_by_user_id=(
                     turn_context.activity.from_property.id if turn_context.activity.from_property else None
                 ),
-                requested_by_user_name=(
-                    turn_context.activity.from_property.name if turn_context.activity.from_property else None
-                ),
+                requested_by_user_name=user_name,
             )
         except Exception:
             LOGGER.exception("Manual Teams sync failed")
@@ -380,10 +387,34 @@ class GraydazeTrainingBot(TeamsActivityHandler):
             )
             return
 
-        await turn_context.send_activity(
-            "The SharePoint refresh has been queued. "
-            f"Job ID: `{accepted.job_id}`."
+        if result.already_running:
+            record = result.progress or {"status": "running", "job_id": result.job_id}
+            started_by = record.get("requested_by_user_name")
+            note = "A vault refresh is already in progress"
+            if started_by:
+                note += f" (started by {started_by})"
+            await turn_context.send_activity(note + ". Here’s its live status:")
+        else:
+            record = {
+                "status": "queued",
+                "phase": "queued",
+                "job_id": result.job_id,
+                "requested_by_user_name": user_name,
+            }
+
+        response = await turn_context.send_activity(
+            Activity(type=ActivityTypes.message, attachments=[build_sync_progress_card(record)])
         )
+
+        activity_id = getattr(response, "id", None)
+        if activity_id and result.job_id:
+            self._sync_monitor.start(
+                job_id=result.job_id,
+                adapter=turn_context.adapter,
+                app_id=self._settings.app_id,
+                conversation_reference=TurnContext.get_conversation_reference(turn_context.activity),
+                activity_id=activity_id,
+            )
 
     async def _extract_query_attachments(
         self,

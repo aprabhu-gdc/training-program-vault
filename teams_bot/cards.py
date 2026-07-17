@@ -10,6 +10,185 @@ from botbuilder.schema import Attachment
 from teams_bot.markdown_card import markdown_to_adaptive_elements
 
 
+_PROGRESS_BAR_WIDTH = 20
+
+_PHASE_LABELS = {
+    "queued": "Waiting for the sync worker",
+    "starting": "Starting",
+    "refreshing_wiki": "Refreshing wiki from SharePoint",
+    "listing": "Listing source files",
+    "processing": "Processing files",
+    "indexing": "Rebuilding the search index",
+    "done": "Done",
+}
+
+
+def _progress_bar(done: int, total: int) -> str:
+    if total <= 0:
+        return ""
+    ratio = max(0.0, min(1.0, done / total))
+    filled = round(ratio * _PROGRESS_BAR_WIDTH)
+    return "▓" * filled + "░" * (_PROGRESS_BAR_WIDTH - filled) + f"  {round(ratio * 100)}%"
+
+
+def _capped_list_items(entries: list[str], *, limit: int = 25) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = [
+        {"type": "TextBlock", "text": text, "wrap": True, "size": "Small"} for text in entries[:limit]
+    ]
+    if len(entries) > limit:
+        items.append(
+            {
+                "type": "TextBlock",
+                "text": f"…and {len(entries) - limit} more",
+                "wrap": True,
+                "size": "Small",
+                "isSubtle": True,
+            }
+        )
+    return items
+
+
+def build_sync_progress_card(record: dict[str, Any], *, stalled: bool = False) -> Attachment:
+    """Render a single, in-place-updatable vault-sync progress card.
+
+    ``record`` is the progress dict served by the ingest API (see
+    packages/wiki_core/ingest/progress.py). The same card id is redrawn via
+    update_activity as the sync advances, so this must render every state:
+    queued, running, stalled, completed, and failed.
+    """
+
+    status = str(record.get("status") or "none")
+    job_id = str(record.get("job_id") or "")
+    requested_by = record.get("requested_by_user_name")
+    files_total = int(record.get("files_total") or 0)
+    files_done = int(record.get("files_done") or 0)
+    updated = int(record.get("updated_files") or 0)
+    skipped = int(record.get("skipped_unchanged") or 0)
+    failed_files = list(record.get("failed_files") or [])
+    empty_files = int(record.get("empty_files") or 0)
+    unsupported = dict(record.get("unsupported_files") or {})
+    current_file = record.get("current_file")
+
+    body: list[dict[str, Any]] = []
+
+    if status == "completed":
+        header = "✅ Vault refresh complete"
+    elif status == "failed":
+        header = "❌ Vault refresh failed"
+    elif stalled:
+        header = "⚠️ Vault refresh appears stalled"
+    elif status in {"queued", "none"}:
+        header = "⏳ Vault refresh queued"
+    else:
+        header = "🔄 Vault refresh in progress"
+    body.append({"type": "TextBlock", "text": header, "weight": "Bolder", "size": "Medium", "wrap": True})
+
+    subtitle_bits = []
+    if requested_by:
+        subtitle_bits.append(f"Requested by {requested_by}")
+    if job_id:
+        subtitle_bits.append(f"Job {job_id[:8]}")
+    if subtitle_bits:
+        body.append(
+            {"type": "TextBlock", "text": " · ".join(subtitle_bits), "isSubtle": True, "size": "Small", "wrap": True}
+        )
+
+    if status not in {"completed", "failed"}:
+        bar = _progress_bar(files_done, files_total)
+        if bar:
+            body.append({"type": "TextBlock", "text": bar, "fontType": "Monospace", "wrap": False})
+        phase_label = _PHASE_LABELS.get(str(record.get("phase") or ""), "Working")
+        facts = [{"title": "Phase", "value": phase_label}]
+        if files_total:
+            facts.append({"title": "Files", "value": f"{files_done} / {files_total}"})
+        facts.append({"title": "Pages updated", "value": str(updated)})
+        if skipped:
+            facts.append({"title": "Skipped (unchanged)", "value": str(skipped)})
+        if failed_files:
+            facts.append({"title": "Failed", "value": str(len(failed_files))})
+        body.append({"type": "FactSet", "facts": facts})
+        if current_file and not stalled:
+            body.append(
+                {"type": "TextBlock", "text": f"Current: {current_file}", "size": "Small", "isSubtle": True, "wrap": True}
+            )
+        if stalled:
+            body.append(
+                {
+                    "type": "TextBlock",
+                    "text": "No worker heartbeat for a while — it may be restarting. Still watching.",
+                    "size": "Small",
+                    "isSubtle": True,
+                    "wrap": True,
+                }
+            )
+        else:
+            body.append(
+                {
+                    "type": "TextBlock",
+                    "text": "This card refreshes about every 10 seconds.",
+                    "size": "Small",
+                    "isSubtle": True,
+                    "wrap": True,
+                }
+            )
+
+    if status in {"completed", "failed"}:
+        summary_facts = [
+            {"title": "Pages updated", "value": str(updated)},
+            {"title": "Skipped (unchanged)", "value": str(skipped)},
+            {"title": "Empty (no text)", "value": str(empty_files)},
+            {"title": "Failed", "value": str(len(failed_files))},
+        ]
+        body.append({"type": "FactSet", "facts": summary_facts})
+        if status == "failed" and record.get("error"):
+            body.append(
+                {"type": "TextBlock", "text": str(record.get("error")), "wrap": True, "color": "Attention", "size": "Small"}
+            )
+
+        needs_separator = True
+
+        def _toggle(title: str, target: str) -> dict[str, Any]:
+            nonlocal needs_separator
+            action_set: dict[str, Any] = {
+                "type": "ActionSet",
+                "actions": [{"type": "Action.ToggleVisibility", "title": title, "targetElements": [target]}],
+            }
+            if needs_separator:
+                action_set["separator"] = True
+                action_set["spacing"] = "Medium"
+                needs_separator = False
+            return action_set
+
+        if failed_files:
+            body.append(_toggle(f"⚠️ Failed files ({len(failed_files)})", "failedSection"))
+            failed_lines = [f"`{entry.get('path', '')}` — {entry.get('error', '')}" for entry in failed_files]
+            body.append(
+                {"type": "Container", "id": "failedSection", "isVisible": False, "items": _capped_list_items(failed_lines)}
+            )
+
+        if unsupported:
+            total_unsupported = sum(unsupported.values())
+            body.append(_toggle(f"⏭️ Unsupported ({total_unsupported})", "unsupportedSection"))
+            unsupported_lines = [f"`{suffix}`: {count}" for suffix, count in sorted(unsupported.items())]
+            body.append(
+                {
+                    "type": "Container",
+                    "id": "unsupportedSection",
+                    "isVisible": False,
+                    "items": _capped_list_items(unsupported_lines),
+                }
+            )
+
+    card = {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.4",
+        "msteams": {"width": "Full"},
+        "body": body,
+    }
+    return CardFactory.adaptive_card(card)
+
+
 def _feedback_buttons(request_id: str, concepts: tuple[str, ...] = ()) -> list[dict[str, Any]]:
     # `data` must stay a JSON object (not a string) so Teams merges the card's
     # Input values (the optional comment) into `activity.value` on submit. The

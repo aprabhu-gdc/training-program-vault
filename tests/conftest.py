@@ -43,6 +43,7 @@ def make_core_settings(base: Path, **overrides):
         vector_manifest_path=base / "index-manifest.json",
         source_sync_state_path=base / "source-sync-state.json",
         sync_job_state_path=base / "sync-job-state.json",
+        sync_progress_path=base / "sync-progress.json",
         rag_top_k=6,
         rag_index_summary_chars=5000,
         max_source_chars=18000,

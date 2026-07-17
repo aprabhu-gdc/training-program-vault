@@ -12,7 +12,10 @@ from workers.source_sync_worker.worker import _process_job
 
 
 def _fake_service(tmp_path):
-    settings = SimpleNamespace(sync_job_state_path=tmp_path / "sync-job-state.json")
+    settings = SimpleNamespace(
+        sync_job_state_path=tmp_path / "sync-job-state.json",
+        sync_progress_path=tmp_path / "sync-progress.json",
+    )
     return SimpleNamespace(
         _settings=settings,
         sync_all_training_files=MagicMock(),
