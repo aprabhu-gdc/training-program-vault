@@ -26,7 +26,29 @@ LOGGER = logging.getLogger(__name__)
 
 
 class WikiIntegrationError(RuntimeError):
-    """Raised when the Teams bot cannot call the existing wiki query layer."""
+    """Raised when the Teams bot cannot call the existing wiki query layer.
+
+    ``category`` lets the bot distinguish a recoverable "the index is being
+    built" state (``"index_not_ready"``) from an opaque backend failure
+    (``"backend"``), so users get an accurate, reassuring message.
+    """
+
+    def __init__(self, *args: Any, category: str = "backend") -> None:
+        super().__init__(*args)
+        self.category = category
+
+
+def _is_index_not_ready(exc: BaseException) -> bool:
+    """Walk the exception chain for an IndexNotReadyError (matched by name to
+    avoid coupling the bot layer to the retrieval package)."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if type(current).__name__ == "IndexNotReadyError":
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 WikiQueryAttachment = QueryAttachment
@@ -95,6 +117,10 @@ class WikiQueryService:
                 f"Wiki query callable timed out after {self._timeout_seconds} seconds."
             ) from exc
         except Exception as exc:
+            if _is_index_not_ready(exc):
+                raise WikiIntegrationError(
+                    "Wiki index is not ready yet.", category="index_not_ready"
+                ) from exc
             raise WikiIntegrationError("Wiki query callable raised an exception.") from exc
 
         # Preserve structured results (with citations) when the callable returns a
