@@ -211,9 +211,14 @@ class GraydazeTrainingBot(TeamsActivityHandler):
             )
         except WikiIntegrationError as exc:
             LOGGER.exception("Wiki integration failure", exc_info=exc)
-            await turn_context.send_activity(
-                "I couldn’t reach the Graydaze PM Training Vault right now. Please try again in a moment."
-            )
+            if getattr(exc, "category", "backend") == "index_not_ready":
+                await turn_context.send_activity(
+                    "The Vault’s search index is being rebuilt right now. Please try again in a few minutes."
+                )
+            else:
+                await turn_context.send_activity(
+                    "I couldn’t reach the Graydaze PM Training Vault right now. Please try again in a moment."
+                )
         finally:
             typing_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

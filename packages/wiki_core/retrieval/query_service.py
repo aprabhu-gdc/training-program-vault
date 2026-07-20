@@ -10,7 +10,7 @@ from packages.contracts.query import Citation, QueryAttachment, QueryRequest, Qu
 from packages.wiki_core.ai.legacy_provider_gateway import LegacyProviderGateway
 from packages.wiki_core.content.file_page_store import FilePageStore
 from packages.wiki_core.content.markdown import clean_obsidian_links, parse_sources_metadata, strip_source_tags
-from packages.wiki_core.retrieval.lancedb_adapter import LanceDbVectorStore
+from packages.wiki_core.retrieval.lancedb_adapter import IndexNotReadyError, LanceDbVectorStore
 from packages.wiki_core.retrieval.models import RetrievedChunk
 from packages.wiki_core.settings import CoreSettings
 
@@ -141,7 +141,7 @@ class QueryService:
 
     async def query(self, request: QueryRequest) -> QueryResponse:
         if not self._vector_store.is_ready():
-            raise RuntimeError(
+            raise IndexNotReadyError(
                 f"Wiki index is not ready at {self._settings.vector_db_path} "
                 f"(table '{self._settings.vector_table_name}'). Build or refresh the index before serving queries."
             )
