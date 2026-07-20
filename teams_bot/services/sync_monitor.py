@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from botbuilder.core import TurnContext
 from botbuilder.schema import Activity, ActivityTypes, ConversationReference
@@ -23,6 +23,12 @@ from packages.wiki_core.ingest.progress import STALE_AFTER_SECONDS, TERMINAL_STA
 
 from teams_bot.cards import build_sync_progress_card
 from teams_bot.services.ingest_admin_client import HttpIngestAdminClient
+
+# A status fetcher returns the current job record (or None), and a card builder
+# renders it. Parameterizing these lets the same poll/redraw loop drive both the
+# sync card and the admin-job (remove/clean/lint) card.
+StatusFetcher = Callable[[], Awaitable[dict[str, Any] | None]]
+CardBuilder = Callable[..., Any]
 
 LOGGER = logging.getLogger(__name__)
 
@@ -49,6 +55,8 @@ class SyncProgressMonitor:
         app_id: str,
         conversation_reference: ConversationReference,
         activity_id: str,
+        fetch_status: StatusFetcher | None = None,
+        build_card: CardBuilder | None = None,
     ) -> None:
         task = asyncio.create_task(
             self._run(
@@ -57,6 +65,8 @@ class SyncProgressMonitor:
                 app_id=app_id,
                 conversation_reference=conversation_reference,
                 activity_id=activity_id,
+                fetch_status=fetch_status or self._ingest_client.get_sync_status,
+                build_card=build_card or build_sync_progress_card,
             )
         )
         self._tasks.add(task)
@@ -76,7 +86,11 @@ class SyncProgressMonitor:
         app_id: str,
         conversation_reference: ConversationReference,
         activity_id: str,
+        fetch_status: StatusFetcher | None = None,
+        build_card: CardBuilder | None = None,
     ) -> None:
+        fetch_status = fetch_status or self._ingest_client.get_sync_status
+        build_card = build_card or build_sync_progress_card
         deadline = time.monotonic() + _MAX_LIFETIME_SECONDS
         last_signature: tuple | None = None
         last_redraw = 0.0
@@ -86,7 +100,7 @@ class SyncProgressMonitor:
 
         while time.monotonic() < deadline:
             await asyncio.sleep(_POLL_SECONDS)
-            record = await self._ingest_client.get_sync_status()
+            record = await fetch_status()
             if not record or record.get("status") == "none":
                 # No record yet (file not written) — keep the initial card and wait.
                 continue
@@ -114,6 +128,7 @@ class SyncProgressMonitor:
                 record.get("skipped_unchanged"),
                 len(record.get("failed_files") or []),
                 stalled,
+                bool(record.get("cancel_requested")),
             )
             now = time.monotonic()
             should_redraw = terminal or (
@@ -129,6 +144,7 @@ class SyncProgressMonitor:
                 activity_id=activity_id,
                 record=record,
                 stalled=stalled,
+                build_card=build_card,
             )
             if redrawn:
                 last_signature = signature
@@ -146,8 +162,9 @@ class SyncProgressMonitor:
         activity_id: str,
         record: dict[str, Any],
         stalled: bool,
+        build_card: CardBuilder,
     ) -> bool:
-        card = build_sync_progress_card(record, stalled=stalled)
+        card = build_card(record, stalled=stalled)
 
         async def _callback(turn_context: TurnContext) -> None:
             activity = Activity(id=activity_id, type=ActivityTypes.message, attachments=[card])

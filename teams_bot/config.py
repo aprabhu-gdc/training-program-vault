@@ -31,6 +31,18 @@ def _read_env(*names: str, default: str = "") -> str:
     return default
 
 
+def _parse_admin_object_ids(raw: str) -> frozenset[str]:
+    """Parse a comma/semicolon/whitespace-separated allowlist, lowercased.
+
+    Entra object IDs are case-insensitive GUIDs; lowercasing both here and at the
+    comparison site makes the check robust to how an admin pasted them.
+    """
+
+    import re
+
+    return frozenset(token.strip().lower() for token in re.split(r"[,;\s]+", raw) if token.strip())
+
+
 @dataclass(frozen=True)
 class Settings:
     """Immutable runtime settings for the bot process."""
@@ -45,6 +57,10 @@ class Settings:
     ingest_admin_http_url: str
     wiki_query_timeout_seconds: float
     welcome_examples: tuple[str, str]
+    # Entra (AAD) object IDs of app admins allowed to run protected commands
+    # (/sync, /stopsync, /remove, /clean, /lint). These are identifiers, not
+    # secrets. An empty set disables all admin commands (fail-closed).
+    admin_object_ids: frozenset[str] = frozenset()
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -71,6 +87,7 @@ class Settings:
                 "What is an ETC and how often should I update it?",
                 "What should I do before a dump meeting?",
             ),
+            admin_object_ids=_parse_admin_object_ids(_read_env("BOT_ADMIN_OBJECT_IDS")),
         )
 
     def validate(self) -> None:
@@ -98,4 +115,10 @@ class Settings:
         if not self.ingest_admin_http_url:
             raise ValueError(
                 "INGEST_ADMIN_HTTP_URL is required so Teams /sync requests can be submitted to the remote ingest API."
+            )
+
+        if not self.admin_object_ids:
+            LOGGER.warning(
+                "BOT_ADMIN_OBJECT_IDS is empty; all admin commands (/sync, /stopsync, /remove, "
+                "/clean, /lint) are disabled. Set it to a comma-separated list of admin Entra object IDs."
             )

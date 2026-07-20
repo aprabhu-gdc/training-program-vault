@@ -65,6 +65,18 @@ class VaultIndexer:
         )
         return report
 
+    def delete_page(self, relative_path: str) -> bool:
+        """Remove one page's vectors and manifest entry. No embedding calls.
+
+        Returns True when the manifest had an entry for the page (i.e. it was
+        indexed). Safe to call for a page that was never indexed.
+        """
+        self._vector_store.delete_by_paths([relative_path])
+        manifest = self._load_manifest()
+        existed = manifest.pop(relative_path, None) is not None
+        self._save_manifest(manifest)
+        return existed
+
     def upsert_modified_files(self, changed_paths: Iterable[Path] | None = None) -> IndexingReport:
         manifest = self._load_manifest()
         existing_files = {

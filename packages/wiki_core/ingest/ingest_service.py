@@ -18,7 +18,7 @@ from packages.shared.documents.extract_text import (
 from packages.wiki_core.ai.legacy_provider_gateway import LegacyProviderGateway
 from packages.wiki_core.content.file_page_store import FilePageStore
 from packages.wiki_core.content.markdown import slugify
-from packages.wiki_core.ingest.progress import ProgressReporter
+from packages.wiki_core.ingest.progress import ProgressReporter, SyncCancelledError
 from packages.wiki_core.ingest.sharepoint_adapter import SharePointSourceSyncAdapter
 from packages.wiki_core.retrieval.index_service import IndexingReport, VaultIndexer
 from packages.wiki_core.settings import CoreSettings
@@ -78,6 +78,10 @@ class AutoIngestService:
         progress = progress or ProgressReporter()
         progress.phase("refreshing_wiki")
         self._refresh_local_wiki_from_sharepoint()
+        if progress.should_cancel():
+            # Cancel during a slow pre-processing phase: stop before listing so the
+            # user isn't waiting on work that will be thrown away.
+            raise SyncCancelledError("Cancelled before file processing began.")
         progress.phase("listing")
         folder_path = self._settings.normalized_sharepoint_raw_root_path
         all_files = self._source_sync.list_files_recursive(folder_path)
@@ -131,7 +135,15 @@ class AutoIngestService:
 
         progress.phase("processing")
         progress.set_total(len(events))
+        cancelled = False
         for event in events:
+            # Cancel checked at file boundaries only, so we never leave a page
+            # half-written or half-published; files already processed below are
+            # published, indexed, and fingerprinted before we raise.
+            if progress.should_cancel():
+                cancelled = True
+                break
+
             event_key = self._event_key(event)
             if event_key and state.get(event.path) == event_key:
                 skipped_files.append(event.path)
@@ -179,6 +191,14 @@ class AutoIngestService:
 
         state.update(processed_state)
         self._save_state(state)
+
+        if cancelled:
+            # Everything processed so far is now durable (published, indexed, and
+            # fingerprinted so it is skipped next time); the unprocessed tail simply
+            # retries on the next sync. Signal a clean, consistent stop.
+            raise SyncCancelledError(
+                f"Cancelled after processing {len(processed_state)} of {len(events)} files."
+            )
 
         return SyncReport(
             requested_files=len(events),

@@ -20,7 +20,11 @@ _PHASE_LABELS = {
     "processing": "Processing files",
     "indexing": "Rebuilding the search index",
     "done": "Done",
+    "cancelled": "Cancelled",
 }
+
+# Statuses at which a sync is finished and the card shows a final summary.
+_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 
 
 def _progress_bar(done: int, total: int) -> str:
@@ -71,10 +75,15 @@ def build_sync_progress_card(record: dict[str, Any], *, stalled: bool = False) -
 
     body: list[dict[str, Any]] = []
 
+    cancel_requested = bool(record.get("cancel_requested"))
     if status == "completed":
         header = "✅ Vault refresh complete"
     elif status == "failed":
         header = "❌ Vault refresh failed"
+    elif status == "cancelled":
+        header = "🛑 Vault refresh cancelled"
+    elif cancel_requested:
+        header = "🛑 Stopping after the current file…"
     elif stalled:
         header = "⚠️ Vault refresh appears stalled"
     elif status in {"queued", "none"}:
@@ -93,7 +102,7 @@ def build_sync_progress_card(record: dict[str, Any], *, stalled: bool = False) -
             {"type": "TextBlock", "text": " · ".join(subtitle_bits), "isSubtle": True, "size": "Small", "wrap": True}
         )
 
-    if status not in {"completed", "failed"}:
+    if status not in _TERMINAL_STATUSES:
         bar = _progress_bar(files_done, files_total)
         if bar:
             body.append({"type": "TextBlock", "text": bar, "fontType": "Monospace", "wrap": False})
@@ -132,7 +141,7 @@ def build_sync_progress_card(record: dict[str, Any], *, stalled: bool = False) -
                 }
             )
 
-    if status in {"completed", "failed"}:
+    if status in _TERMINAL_STATUSES:
         summary_facts = [
             {"title": "Pages updated", "value": str(updated)},
             {"title": "Skipped (unchanged)", "value": str(skipped)},
@@ -187,6 +196,147 @@ def build_sync_progress_card(record: dict[str, Any], *, stalled: bool = False) -
         "body": body,
     }
     return CardFactory.adaptive_card(card)
+
+
+def _adaptive_card(body: list[dict[str, Any]], *, actions: list[dict[str, Any]] | None = None) -> Attachment:
+    card: dict[str, Any] = {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.4",
+        "msteams": {"width": "Full"},
+        "body": body,
+    }
+    if actions:
+        card["actions"] = actions
+    return CardFactory.adaptive_card(card)
+
+
+def build_admin_confirm_card(
+    *,
+    title: str,
+    facts: list[tuple[str, str]],
+    warnings: list[str],
+    token: str,
+    initiator_name: str | None,
+) -> Attachment:
+    """Preview + confirm card for a destructive admin action.
+
+    Confirm/Cancel submits carry ``{action, token}`` so the bot can resolve the
+    pending action and enforce initiator-only confirmation.
+    """
+    body: list[dict[str, Any]] = [
+        {"type": "TextBlock", "text": title, "weight": "Bolder", "size": "Medium", "wrap": True},
+    ]
+    if facts:
+        body.append({"type": "FactSet", "facts": [{"title": t, "value": v} for t, v in facts]})
+    for warning in warnings:
+        body.append({"type": "TextBlock", "text": f"⚠️ {warning}", "wrap": True, "color": "Attention", "size": "Small"})
+    footer = "Only " + (initiator_name or "the requester") + " can confirm. This request expires in 5 minutes."
+    body.append({"type": "TextBlock", "text": footer, "wrap": True, "isSubtle": True, "size": "Small"})
+
+    actions = [
+        {"type": "Action.Submit", "title": "Confirm", "style": "destructive", "data": {"action": "admin_confirm", "token": token}},
+        {"type": "Action.Submit", "title": "Cancel", "data": {"action": "admin_cancel", "token": token}},
+    ]
+    return _adaptive_card(body, actions=actions)
+
+
+def build_admin_result_card(title: str, message: str, *, tone: str = "default") -> Attachment:
+    """Simple terminal card that replaces a confirm card once resolved."""
+    color = {"good": "Good", "warning": "Warning", "attention": "Attention"}.get(tone, "Default")
+    body = [
+        {"type": "TextBlock", "text": title, "weight": "Bolder", "size": "Medium", "wrap": True, "color": color},
+        {"type": "TextBlock", "text": message, "wrap": True},
+    ]
+    return _adaptive_card(body)
+
+
+_ADMIN_PHASE_LABELS = {
+    "queued": "Waiting for the worker",
+    "starting": "Starting",
+    "removing": "Removing page",
+    "reconciling": "Reconciling the index",
+    "pruning_state": "Pruning stale source state",
+    "pruning_job_state": "Pruning job history",
+    "scanning": "Scanning pages",
+    "auditing": "Auditing with the model",
+    "reporting": "Writing the report",
+    "done": "Done",
+    "cancelled": "Cancelled",
+}
+
+_ADMIN_JOB_TITLES = {"remove": "Remove page", "clean": "Vault cleanup", "lint": "Vault lint"}
+
+
+def build_admin_job_card(record: dict[str, Any], *, stalled: bool = False) -> Attachment:
+    """Render a remove/clean/lint job's live progress and terminal summary."""
+    status = str(record.get("status") or "none")
+    job_type = str(record.get("job_type") or "")
+    requested_by = record.get("requested_by_user_name")
+    result = record.get("result") or {}
+    title = _ADMIN_JOB_TITLES.get(job_type, "Admin job")
+
+    if status == "completed":
+        header = f"✅ {title} complete"
+    elif status == "failed":
+        header = f"❌ {title} failed"
+    elif status == "cancelled":
+        header = f"🛑 {title} cancelled"
+    elif stalled:
+        header = f"⚠️ {title} appears stalled"
+    elif status in {"queued", "none"}:
+        header = f"⏳ {title} queued"
+    else:
+        header = f"🔄 {title} in progress"
+
+    body: list[dict[str, Any]] = [
+        {"type": "TextBlock", "text": header, "weight": "Bolder", "size": "Medium", "wrap": True}
+    ]
+    if requested_by:
+        body.append({"type": "TextBlock", "text": f"Requested by {requested_by}", "isSubtle": True, "size": "Small", "wrap": True})
+
+    if status not in _TERMINAL_STATUSES:
+        phase = _ADMIN_PHASE_LABELS.get(str(record.get("phase") or ""), "Working")
+        body.append({"type": "FactSet", "facts": [{"title": "Phase", "value": phase}]})
+        body.append({"type": "TextBlock", "text": "This card refreshes about every 10 seconds.", "isSubtle": True, "size": "Small", "wrap": True})
+        return _adaptive_card(body)
+
+    if status == "failed" and record.get("error"):
+        body.append({"type": "TextBlock", "text": str(record.get("error")), "wrap": True, "color": "Attention", "size": "Small"})
+
+    body.extend(_admin_result_elements(job_type, result))
+    return _adaptive_card(body)
+
+
+def _admin_result_elements(job_type: str, result: dict[str, Any]) -> list[dict[str, Any]]:
+    if not result:
+        return []
+    if job_type == "remove":
+        facts = [
+            ("Path", str(result.get("path", ""))),
+            ("Removed from SharePoint", "yes" if result.get("sharepoint_deleted") else "no"),
+            ("Removed locally", "yes" if result.get("local_deleted") else "no"),
+            ("Index rows removed", "yes" if result.get("index_rows_deleted") else "no"),
+            ("index.md entry removed", "yes" if result.get("index_entry_removed") else "no (hand-edit may be needed)"),
+        ]
+        return [{"type": "FactSet", "facts": [{"title": t, "value": v} for t, v in facts]}]
+    if job_type == "clean":
+        facts = [
+            ("Pages re-indexed", str(result.get("reindexed", 0))),
+            ("Index entries deleted", str(result.get("index_deleted", 0))),
+            ("State entries pruned", str(result.get("state_pruned", 0))),
+            ("Job history trimmed", str(result.get("job_ids_pruned", 0))),
+        ]
+        return [{"type": "FactSet", "facts": [{"title": t, "value": v} for t, v in facts]}]
+    if job_type == "lint":
+        by_type = result.get("by_type") or {}
+        facts = [("Pages scanned", str(result.get("pages_scanned", 0))), ("Findings", str(result.get("findings_total", 0)))]
+        facts.extend((kind, str(count)) for kind, count in sorted(by_type.items()))
+        elements: list[dict[str, Any]] = [{"type": "FactSet", "facts": [{"title": t, "value": v} for t, v in facts]}]
+        if result.get("report_path"):
+            elements.append({"type": "TextBlock", "text": f"Full report: `{result['report_path']}`", "wrap": True, "size": "Small"})
+        return elements
+    return []
 
 
 def _feedback_buttons(request_id: str, concepts: tuple[str, ...] = ()) -> list[dict[str, Any]]:

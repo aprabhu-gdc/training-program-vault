@@ -129,7 +129,7 @@ Rules:
 - append only
 - do not rewrite historical substance except for typo or link fixes
 - keep entries terse and parseable
-- use operation labels such as `setup`, `ingest`, `query`, `lint`, `rename`, `merge`, or `review`
+- use operation labels such as `setup`, `ingest`, `query`, `lint`, `remove`, `rename`, `merge`, or `review`
 
 ## Workflow Classification
 Every interaction should be treated as one of these modes unless the user says otherwise:

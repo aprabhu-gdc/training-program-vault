@@ -78,6 +78,36 @@ class FilePageStore:
         self._write_existing_page(path, frontmatter, updated)
         return True
 
+    def remove_index_entry(self, relative_path: str) -> bool:
+        """Remove any index.md bullet linking to ``relative_path``.
+
+        Matches by wikilink target (the inverse of build_index_entry/
+        upsert_index_entry). Hand-edited lines that don't follow the
+        ``- [[target|Title]] - desc`` convention won't be matched — callers should
+        surface that so an admin can hand-edit. Returns True if a line was removed.
+        """
+        target = relative_path.removesuffix(".md")
+        path = self._settings.index_path
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return False
+
+        frontmatter, body = split_frontmatter(text)
+        kept: list[str] = []
+        removed = False
+        for line in body.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("- ") and self._entry_target(stripped) == target:
+                removed = True
+                continue
+            kept.append(line)
+
+        if not removed:
+            return False
+        self._write_existing_page(path, frontmatter, "\n".join(kept).rstrip() + "\n")
+        return True
+
     def append_overview_note(self, note: str) -> bool:
         note = note.strip()
         if not note:

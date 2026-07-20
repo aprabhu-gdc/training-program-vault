@@ -106,6 +106,23 @@ class CoreSettings:
     # touching the interactive answering path.
     llm_ingest_provider: str = ""
     llm_ingest_model: str = ""
+    # Admin-job progress record (remove/clean/lint). Kept separate from
+    # sync_progress_path so the duplicate-sync gate and the sync progress card
+    # never mix admin jobs with source syncs. Auto-derived when unset.
+    admin_job_progress_path: Path | None = None
+    # Cooperative sync-cancel sentinel (see progress.write_cancel). A dedicated
+    # file, because the worker rewrites the whole sync-progress record on every
+    # heartbeat and would clobber a cancel flag stored inside it. Auto-derived.
+    sync_cancel_path: Path | None = None
+
+    def __post_init__(self) -> None:
+        # Derive optional data-file paths from the sync-progress directory when a
+        # caller (e.g. the offline test fixture) did not set them explicitly.
+        data_dir = self.sync_progress_path.parent
+        if self.admin_job_progress_path is None:
+            object.__setattr__(self, "admin_job_progress_path", data_dir / "admin-job-progress.json")
+        if self.sync_cancel_path is None:
+            object.__setattr__(self, "sync_cancel_path", data_dir / "sync-cancel.json")
 
     @classmethod
     def from_env(cls) -> "CoreSettings":
@@ -132,6 +149,14 @@ class CoreSettings:
         )
         sync_progress_path = _resolve_path(
             _read_env("SYNC_PROGRESS_PATH", default=str(local_data_root / "sync-progress.json")),
+            base=local_data_root,
+        )
+        admin_job_progress_path = _resolve_path(
+            _read_env("ADMIN_JOB_PROGRESS_PATH", default=str(local_data_root / "admin-job-progress.json")),
+            base=local_data_root,
+        )
+        sync_cancel_path = _resolve_path(
+            _read_env("SYNC_CANCEL_PATH", default=str(local_data_root / "sync-cancel.json")),
             base=local_data_root,
         )
 
@@ -202,6 +227,8 @@ class CoreSettings:
             ),
             llm_ingest_provider=_read_env("LLM_INGEST_PROVIDER"),
             llm_ingest_model=_read_env("LLM_INGEST_MODEL"),
+            admin_job_progress_path=admin_job_progress_path,
+            sync_cancel_path=sync_cancel_path,
         )
 
     @property
@@ -273,6 +300,8 @@ class CoreSettings:
         self.source_sync_state_path.parent.mkdir(parents=True, exist_ok=True)
         self.sync_job_state_path.parent.mkdir(parents=True, exist_ok=True)
         self.sync_progress_path.parent.mkdir(parents=True, exist_ok=True)
+        self.admin_job_progress_path.parent.mkdir(parents=True, exist_ok=True)
+        self.sync_cancel_path.parent.mkdir(parents=True, exist_ok=True)
 
     def validate_llm(self) -> None:
         if not self.chat_provider:

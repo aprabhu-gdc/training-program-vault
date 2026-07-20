@@ -15,6 +15,7 @@ def _fake_service(tmp_path):
     settings = SimpleNamespace(
         sync_job_state_path=tmp_path / "sync-job-state.json",
         sync_progress_path=tmp_path / "sync-progress.json",
+        sync_cancel_path=tmp_path / "sync-cancel.json",
     )
     return SimpleNamespace(
         _settings=settings,

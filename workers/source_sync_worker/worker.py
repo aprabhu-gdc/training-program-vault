@@ -13,12 +13,40 @@ from packages.shared.documents.extract_text import CONVERTIBLE_EXTENSIONS, SUPPO
 from packages.shared.logging import configure_logging
 from packages.shared.messaging.service_bus import process_queue_messages
 from packages.wiki_core.ingest.ingest_service import AutoIngestService
-from packages.wiki_core.ingest.progress import FileProgressReporter
+from packages.wiki_core.ingest.progress import (
+    FileProgressReporter,
+    SyncCancelledError,
+    cancel_requested_for,
+    clear_cancel,
+    read_cancel,
+)
+from packages.wiki_core.maintenance.vault_admin import VaultAdminService
 
 from .config import WorkerSettings
 
 
 LOGGER = logging.getLogger(__name__)
+
+_ADMIN_SERVICE: VaultAdminService | None = None
+
+
+def _get_admin_service(service: AutoIngestService) -> VaultAdminService:
+    """Lazily build (and cache) the maintenance service, like AutoIngestService."""
+    global _ADMIN_SERVICE
+    if _ADMIN_SERVICE is None:
+        _ADMIN_SERVICE = VaultAdminService(service._settings)
+    return _ADMIN_SERVICE
+
+
+def _clear_stale_foreign_cancel(cancel_path, job_id: str) -> None:
+    """Drop a cancel sentinel left over from a *different* job.
+
+    A stale sentinel must never cancel a later sync it was not meant for.
+    """
+    record = read_cancel(cancel_path)
+    if record and record.get("job_id") != job_id:
+        LOGGER.info("Clearing stale cancel sentinel for old job_id=%s", record.get("job_id"))
+        clear_cancel(cancel_path)
 
 
 def _load_processed_jobs(service: AutoIngestService) -> set[str]:
@@ -55,19 +83,46 @@ def _process_job(payload: dict[str, Any], service: AutoIngestService) -> None:
     LOGGER.info("Processing source sync job job_id=%s job_type=%s", job_id, job_type)
 
     if job_type == "manual":
+        cancel_path = service._settings.sync_cancel_path
+        requested_by = (
+            str(payload.get("requested_by_user_name")) if payload.get("requested_by_user_name") else None
+        )
         reporter = FileProgressReporter(
             service._settings.sync_progress_path,
             job_id=job_id,
             job_type="manual",
-            requested_by_user_name=(str(payload.get("requested_by_user_name")) if payload.get("requested_by_user_name") else None),
+            requested_by_user_name=requested_by,
+            cancel_path=cancel_path,
         )
+
+        # Cancel-before-start: a stop requested while the job was still queued is
+        # honoured without ever starting the (hours-long) sync.
+        if cancel_requested_for(cancel_path, job_id):
+            LOGGER.info("Manual sync job_id=%s cancelled before start", job_id)
+            reporter.finish_cancelled()
+            clear_cancel(cancel_path)
+            processed_job_ids.add(job_id)
+            _save_processed_jobs(service, processed_job_ids)
+            return
+
+        _clear_stale_foreign_cancel(cancel_path, job_id)
         reporter.start()
         try:
             service.sync_all_training_files(progress=reporter)
+        except SyncCancelledError:
+            # Clean cooperative stop: return normally so the Service Bus message is
+            # COMPLETED (raising would abandon it and redeliver, restarting the sync).
+            LOGGER.info("Manual sync job_id=%s cancelled mid-run", job_id)
+            reporter.finish_cancelled()
+            clear_cancel(cancel_path)
+            processed_job_ids.add(job_id)
+            _save_processed_jobs(service, processed_job_ids)
+            return
         except Exception as exc:
             reporter.finish_error(f"{type(exc).__name__}: {exc}")
             raise
         reporter.finish_ok()
+        clear_cancel(cancel_path)  # clear any late sentinel that raced completion
         processed_job_ids.add(job_id)
         _save_processed_jobs(service, processed_job_ids)
         return
@@ -95,6 +150,34 @@ def _process_job(payload: dict[str, Any], service: AutoIngestService) -> None:
             entry_id=(str(job_payload.get("entry_id")) if job_payload.get("entry_id") else None),
         )
         service.sync_events([event])
+        processed_job_ids.add(job_id)
+        _save_processed_jobs(service, processed_job_ids)
+        return
+
+    if job_type in {"remove", "clean", "lint"}:
+        requested_by = (
+            str(payload.get("requested_by_user_name")) if payload.get("requested_by_user_name") else None
+        )
+        reporter = FileProgressReporter(
+            service._settings.admin_job_progress_path,
+            job_id=job_id,
+            job_type=job_type,
+            requested_by_user_name=requested_by,
+        )
+        reporter.start()
+        admin = _get_admin_service(service)
+        job_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+        try:
+            if job_type == "remove":
+                admin.remove_page(str(job_payload.get("path") or ""), requested_by=requested_by, progress=reporter)
+            elif job_type == "clean":
+                admin.clean(progress=reporter)
+            else:
+                admin.lint(progress=reporter)
+        except Exception as exc:
+            # The service calls finish_ok() itself on success; on failure record it here.
+            reporter.finish_error(f"{type(exc).__name__}: {exc}")
+            raise
         processed_job_ids.add(job_id)
         _save_processed_jobs(service, processed_job_ids)
         return
@@ -139,19 +222,29 @@ def _run_reconcile(service: AutoIngestService) -> None:
     """
 
     LOGGER.info("Running scheduled reconciliation sync")
+    cancel_path = service._settings.sync_cancel_path
+    job_id = uuid.uuid4().hex
     reporter = FileProgressReporter(
         service._settings.sync_progress_path,
-        job_id=uuid.uuid4().hex,
+        job_id=job_id,
         job_type="scheduled",
+        cancel_path=cancel_path,
     )
+    _clear_stale_foreign_cancel(cancel_path, job_id)
     reporter.start()
     try:
         service.sync_all_training_files(progress=reporter)
+    except SyncCancelledError:
+        LOGGER.info("Scheduled reconciliation sync cancelled")
+        reporter.finish_cancelled()
+        clear_cancel(cancel_path)
+        return
     except Exception as exc:
         reporter.finish_error(f"{type(exc).__name__}: {exc}")
         LOGGER.exception("Reconciliation sync failed; retrying next interval")
         return
     reporter.finish_ok()
+    clear_cancel(cancel_path)
 
 
 def main() -> int:

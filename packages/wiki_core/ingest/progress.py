@@ -29,8 +29,18 @@ _MAX_LISTED_FILES = 50
 # the worker almost certainly died or restarted mid-run.
 STALE_AFTER_SECONDS = 600.0
 
-TERMINAL_STATUSES = {"completed", "failed"}
+TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 ACTIVE_STATUSES = {"queued", "running"}
+
+
+class SyncCancelledError(Exception):
+    """Raised inside a sync when a cooperative cancel has been requested.
+
+    Defined here (not in the worker/ingest modules) so both can import it without
+    a cycle. The worker treats this as a *clean* stop: it writes a terminal
+    "cancelled" record and completes the Service Bus message rather than
+    abandoning it (which would redeliver and restart the sync).
+    """
 
 
 def _now_iso() -> str:
@@ -86,6 +96,7 @@ def write_queued(path: Path, *, job_id: str, job_type: str, requested_by_user_na
         "updated_at": _now_iso(),
         "finished_at": None,
         "error": None,
+        "result": None,
     }
     _atomic_write(path, record)
 
@@ -97,6 +108,74 @@ def _atomic_write(path: Path, record: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+# --- Cooperative sync cancellation -------------------------------------------
+# The cancel request lives in its own sentinel file (not the progress record),
+# because the worker rewrites the whole progress record on every heartbeat and
+# would clobber a flag stored there. The sentinel is keyed by job_id so a stale
+# request can never cancel a *different* (later) sync.
+
+
+def write_cancel(path: Path, *, job_id: str, requested_by_user_name: str | None) -> None:
+    """Request cancellation of the given job (best-effort, idempotent)."""
+
+    _atomic_write(
+        path,
+        {
+            "job_id": job_id,
+            "requested_at": _now_iso(),
+            "requested_by_user_name": requested_by_user_name,
+        },
+    )
+
+
+def read_cancel(path: Path) -> dict[str, Any] | None:
+    """Return the current cancel request, or None if absent/unreadable."""
+
+    try:
+        if not path.exists():
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def clear_cancel(path: Path) -> None:
+    """Remove the cancel sentinel (best-effort)."""
+
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        LOGGER.debug("Failed to clear cancel sentinel at %s", path, exc_info=True)
+
+
+def cancel_requested_for(path: Path, job_id: str) -> bool:
+    """True when a cancel sentinel exists and targets exactly this job_id."""
+
+    record = read_cancel(path)
+    return bool(record) and record.get("job_id") == job_id
+
+
+def write_cancelled_from(path: Path, record: dict[str, Any], *, error: str | None = None) -> dict[str, Any]:
+    """Overwrite a progress record as terminally 'cancelled' (for stale jobs).
+
+    Used by the API when a sync has stopped heart-beating: the worker will never
+    write a terminal record itself, so the status must be corrected in place to
+    keep the progress card truthful.
+    """
+
+    updated = dict(record)
+    updated["status"] = "cancelled"
+    updated["phase"] = "cancelled"
+    updated["current_file"] = None
+    updated["finished_at"] = _now_iso()
+    updated["updated_at"] = _now_iso()
+    if error is not None:
+        updated["error"] = error
+    _atomic_write(path, updated)
+    return updated
+
+
 class ProgressReporter:
     """No-op reporter. The default so existing callers need no changes."""
 
@@ -106,8 +185,14 @@ class ProgressReporter:
     def set_unsupported(self, unsupported: dict[str, int]) -> None: ...
     def begin_file(self, path: str) -> None: ...
     def record(self, outcome: str, *, path: str | None = None, error: str | None = None) -> None: ...
+    def set_result(self, result: dict[str, Any]) -> None: ...
     def finish_ok(self) -> None: ...
     def finish_error(self, message: str) -> None: ...
+    def finish_cancelled(self) -> None: ...
+
+    def should_cancel(self) -> bool:
+        """Whether a cooperative cancel has been requested for this job."""
+        return False
 
 
 class FileProgressReporter(ProgressReporter):
@@ -125,8 +210,11 @@ class FileProgressReporter(ProgressReporter):
         job_id: str,
         job_type: str,
         requested_by_user_name: str | None = None,
+        cancel_path: Path | None = None,
     ) -> None:
         self._path = path
+        self._cancel_path = cancel_path
+        self._job_id = job_id
         self._record: dict[str, Any] = {
             "job_id": job_id,
             "job_type": job_type,
@@ -145,7 +233,13 @@ class FileProgressReporter(ProgressReporter):
             "updated_at": _now_iso(),
             "finished_at": None,
             "error": None,
+            "result": None,
         }
+
+    def should_cancel(self) -> bool:
+        if self._cancel_path is None:
+            return False
+        return cancel_requested_for(self._cancel_path, self._job_id)
 
     def start(self, *, requested_by_user_name: str | None = None) -> None:
         if requested_by_user_name is not None:
@@ -190,6 +284,14 @@ class FileProgressReporter(ProgressReporter):
         self._record["files_done"] += 1
         self._flush()
 
+    def set_result(self, result: dict[str, Any]) -> None:
+        """Attach a job-type-specific summary, preserved through finish_ok().
+
+        Paths and counts only — never page content or secrets (data-security).
+        """
+        self._record["result"] = dict(result)
+        self._flush()
+
     def finish_ok(self) -> None:
         self._record["status"] = "completed"
         self._record["phase"] = "done"
@@ -201,6 +303,13 @@ class FileProgressReporter(ProgressReporter):
         self._record["status"] = "failed"
         self._record["current_file"] = None
         self._record["error"] = message
+        self._record["finished_at"] = _now_iso()
+        self._flush()
+
+    def finish_cancelled(self) -> None:
+        self._record["status"] = "cancelled"
+        self._record["phase"] = "cancelled"
+        self._record["current_file"] = None
         self._record["finished_at"] = _now_iso()
         self._flush()
 
