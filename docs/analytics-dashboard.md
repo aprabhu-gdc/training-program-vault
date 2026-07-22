@@ -24,15 +24,15 @@ Each question is classified as its **single most relevant** wiki concept.
 
 | Column | Type | Notes |
 | --- | --- | --- |
-| Title | text | Full concept title (SharePoint's built-in column), e.g. "Estimate to Complete" |
+| Title | text | Full concept title (SharePoint's built-in column), e.g. "Safety Near Live Power Lines" |
 | Timestamp | dateTime | UTC, ISO 8601 |
 | RequestId | text | The answered question (one row per question) |
 | UserId | text | Teams user id (stable, opaque) |
 | UserName | text | Teams display name — use for the user slicer |
-| Concept | text | **Short dashboard label** (e.g. `ETC`, `RAMP`), or `Unknown` — use this on chart axes |
+| Concept | text | **Readable dashboard label** (e.g. `Estimate to Complete (ETC)`, `Safety Near Live Power Lines`), or `Unknown` — use this on chart axes |
 | IsUnknown | boolean | True when no wiki concept was relevant |
 
-> Labels come from `teams_bot/services/concept_labels.py` (a slug→label override table plus an acronym heuristic for new concepts). **Rows written before 2026-07-16 store the full title in `Concept`**, so a bar chart by `Concept` shows both "Estimate to Complete" and "ETC" as separate bars until the historical rows are relabeled or filtered out (`Timestamp` slicer) — an owner decision, not a code change.
+> Labels come from `teams_bot/services/concept_labels.py` (a slug→label override table plus a readable heuristic for new concepts). Labels favor readable names over initialisms and only use an acronym when the wiki uses it — phrase-acronyms are spelled out with the acronym in parentheses (`Estimate to Complete (ETC)`), while proper-noun/product acronyms stay as-is (`RAMP`, `OSHA`, `DOWSIL`). Labels apply at write time, so a change to the mapping affects only rows written after the bot is redeployed.
 
 ### `TrainingBotFeedback` — one row per feedback submission
 
@@ -112,6 +112,54 @@ Suggested layout:
 Publish to the Power BI Service and set **scheduled refresh** — SharePoint
 Online lists refresh with OAuth credentials, no gateway needed. A daily or
 hourly refresh is plenty at this volume.
+
+## Event-driven refresh (refresh when the lists change)
+
+An imported Power BI dataset cannot refresh on literally every write, and Power
+BI caps total refreshes at **8/day (Pro)** or **48/day (Premium/Fabric)** —
+scheduled and API/flow-triggered refreshes share that budget. To refresh close
+to "on change" while staying under the cap, use **Power Automate**:
+
+1. **Trigger** — *SharePoint → When an item is created or modified*, site = the
+   team site, list = `TrainingBotQueryEvents`. Create a **second, identical
+   flow** for `TrainingBotFeedback` (a flow has a single trigger, so two flows
+   is simplest).
+2. **Throttle to protect the daily cap** — set the flow's **Concurrency control
+   to 1**, then collapse bursts into at most a few refreshes per window. Either
+   add a *Delay until* the next fixed window, or a *Condition* that skips the
+   refresh if one already ran within the last N minutes (track "last refresh
+   time" in a small helper SharePoint list or an environment variable). Pick the
+   window to fit your license: **≥ ~3 hr between refreshes on Pro** (≤ 8/day),
+   or **~15 min on Premium/Fabric** (≤ 48/day).
+3. **Action** — *Power BI → Refresh a dataset*, Workspace = the dashboard
+   workspace, Dataset = `TrainingBotAnalytics`.
+
+**Prerequisite (one-time):** bind the semantic model's SharePoint data-source
+credentials in the Service (semantic model → Settings → Data source credentials
+→ Edit → OAuth2 → sign in). Without it, both flow-driven and scheduled refreshes
+fail — see the note in `powerbi/set_refresh_schedule.py`. **Keep** the daily
+schedule from that script as a safety net.
+
+## Clearing the analytics data (start fresh)
+
+To wipe both lists and reset the dashboard. **This is irreversible and removes
+user-attributed data (Teams names + ids + free-text feedback comments).** The
+bot writes app-only (`Sites.Selected`) and has no delete path, so deletion is a
+one-time admin action in SharePoint.
+
+1. Open the *Training Program Vault* team site
+   (`https://graydazeb.sharepoint.com`).
+2. For **each** list — `TrainingBotQueryEvents` and `TrainingBotFeedback`: open
+   it → switch to the **All Items** view → tick the header checkbox to select
+   all → **Delete**. Repeat per page if the list is paginated.
+3. **Empty the recycle bins** so the data is actually gone, not just hidden:
+   site **Recycle bin** (first stage), then **Second-stage recycle bin** (Site
+   Contents → Recycle bin → *Second-stage recycle bin*). Otherwise deleted rows
+   linger ~93 days.
+4. **Refresh the dataset** so the dashboard reflects the empty lists:
+   `python powerbi/set_refresh_schedule.py --workspace "<Workspace Name>" --refresh-now`
+   (or wait for the scheduled / flow-driven refresh). Until a refresh runs, the
+   dashboard still shows the previously cached rows.
 
 ## Adding new training material (ingest)
 
