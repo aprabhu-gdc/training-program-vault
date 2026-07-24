@@ -18,12 +18,28 @@ class QueryAttachment:
 
 
 @dataclass(frozen=True)
+class ConversationTurn:
+    """One prior message in a chat session (user question or bot answer).
+
+    Text-only by design: attachments/images are never retained in history, both
+    to keep the transient conversation state small and to avoid re-sending large
+    base64 blobs on every follow-up turn.
+    """
+
+    role: str  # "user" or "assistant"
+    text: str
+
+
+@dataclass(frozen=True)
 class QueryRequest:
     request_id: str
     query: str
     identity: CallerIdentity
     attachments: tuple[QueryAttachment, ...] = ()
     client_context: dict[str, Any] = field(default_factory=dict)
+    # Recent prior turns for multi-turn follow-ups, oldest first. Empty for a
+    # fresh session or a stateless caller.
+    history: tuple[ConversationTurn, ...] = ()
 
 
 @dataclass(frozen=True)

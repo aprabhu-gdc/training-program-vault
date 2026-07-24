@@ -6,7 +6,13 @@ import logging
 from typing import Any, Mapping
 
 from packages.contracts.identity import CallerIdentity
-from packages.contracts.query import Citation, QueryAttachment, QueryRequest, QueryResponse
+from packages.contracts.query import (
+    Citation,
+    ConversationTurn,
+    QueryAttachment,
+    QueryRequest,
+    QueryResponse,
+)
 from packages.wiki_core.ai.legacy_provider_gateway import LegacyProviderGateway
 from packages.wiki_core.content.file_page_store import FilePageStore
 from packages.wiki_core.content.markdown import clean_obsidian_links, parse_sources_metadata, strip_source_tags
@@ -100,17 +106,46 @@ def _normalize_attachments(raw_attachments: list[Any]) -> list[QueryAttachment]:
     return attachments
 
 
-def _build_retrieval_query(query: str, attachments: list[QueryAttachment]) -> str:
-    if not attachments:
-        return query
+def _normalize_history(raw_history: list[Any]) -> list[ConversationTurn]:
+    turns: list[ConversationTurn] = []
+    for item in raw_history:
+        if isinstance(item, ConversationTurn):
+            if item.text.strip():
+                turns.append(item)
+            continue
+        if isinstance(item, Mapping):
+            role = str(item.get("role") or "").strip().lower()
+            text = str(item.get("text") or item.get("content") or "").strip()
+            if role in {"user", "assistant"} and text:
+                turns.append(ConversationTurn(role=role, text=text))
+    return turns
 
+
+def _history_messages(history: list[ConversationTurn]) -> list[dict[str, Any]]:
+    """Prior turns as OpenAI-style chat messages (oldest first, text only)."""
+
+    return [{"role": turn.role, "content": turn.text} for turn in history]
+
+
+def _build_retrieval_query(
+    query: str,
+    attachments: list[QueryAttachment],
+    history: list[ConversationTurn] | None = None,
+) -> str:
     parts = [query.strip()]
+    # Recent user turns disambiguate short follow-ups ("what about the second
+    # one?") so vector search retrieves chunks relevant to the running topic.
+    for turn in (history or []):
+        if turn.role == "user" and turn.text.strip():
+            parts.append("Earlier question: " + turn.text.strip()[:500])
     for attachment in attachments:
         name = attachment.name.strip()
         if name:
             parts.append(f"Attachment name: {name}")
         if attachment.text_content:
             parts.append("Attachment excerpt: " + attachment.text_content[:1500])
+    if len(parts) == 1 and not attachments:
+        return query
     combined = "\n".join(part for part in parts if part)
     return combined[:4000] or query
 
@@ -147,7 +182,8 @@ class QueryService:
             )
 
         attachments = _normalize_attachments(list(request.attachments))
-        retrieval_query = _build_retrieval_query(request.query, attachments)
+        history = _normalize_history(list(request.history))
+        retrieval_query = _build_retrieval_query(request.query, attachments, history)
         query_embedding = (await self._model_gateway.embed_texts_async([retrieval_query]))[0]
         results = self._vector_store.search(query_embedding, top_k=self._settings.rag_top_k)
         LOGGER.info(
@@ -181,6 +217,7 @@ class QueryService:
             user_prompt=_build_user_content(query=request.query, chunks=chunks, attachments=attachments),
             temperature=0.1,
             requires_vision=any(attachment.image_data_url for attachment in attachments),
+            history=_history_messages(history),
         )
 
         citations = tuple(
@@ -243,5 +280,6 @@ async def query_vault_structured(query: str, request_id: str, **kwargs) -> Query
         identity=identity,
         attachments=tuple(kwargs.get("attachments") or ()),
         client_context={"channel_data": kwargs.get("channel_data")},
+        history=tuple(kwargs.get("history") or ()),
     )
     return await QueryService().query(request)

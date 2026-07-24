@@ -61,6 +61,12 @@ class Settings:
     # (/sync, /stopsync, /remove, /clean, /lint). These are identifiers, not
     # secrets. An empty set disables all admin commands (fail-closed).
     admin_object_ids: frozenset[str] = frozenset()
+    # Short-term conversation memory (in-process only). A "session" is a run of
+    # turns with less than session_idle_minutes between them; after that idle gap
+    # history is cleared so an unrelated later question starts fresh.
+    history_max_turns: int = 6
+    history_char_budget: int = 6000
+    session_idle_minutes: float = 30.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -88,6 +94,9 @@ class Settings:
                 "What should I do before a dump meeting?",
             ),
             admin_object_ids=_parse_admin_object_ids(_read_env("BOT_ADMIN_OBJECT_IDS")),
+            history_max_turns=int(_read_env("BOT_HISTORY_MAX_TURNS", default="6")),
+            history_char_budget=int(_read_env("BOT_HISTORY_CHAR_BUDGET", default="6000")),
+            session_idle_minutes=float(_read_env("BOT_SESSION_IDLE_MINUTES", default="30")),
         )
 
     def validate(self) -> None:

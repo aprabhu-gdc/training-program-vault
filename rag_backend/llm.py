@@ -141,17 +141,20 @@ async def complete_text_async(
     settings: BackendSettings,
     temperature: float = 0.1,
     requires_vision: bool = False,
+    history: list[dict[str, Any]] | None = None,
 ) -> str:
     provider = settings.vision_provider if requires_vision else settings.chat_provider
     if provider in {"openai", "azure-openai"}:
         client = create_async_client(settings, provider=provider)
+        # Prior turns (oldest first) sit between the system prompt and the current
+        # user turn so the model can resolve follow-ups. They are text-only.
+        messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+        messages.extend(history or [])
+        messages.append({"role": "user", "content": user_prompt})
         response = await client.chat.completions.create(
             model=_chat_model(settings, requires_vision=requires_vision),
             temperature=temperature,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+            messages=messages,
         )
         return (response.choices[0].message.content or "").strip()
 
