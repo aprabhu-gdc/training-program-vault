@@ -56,7 +56,6 @@ class Settings:
     wiki_query_http_url: str
     ingest_admin_http_url: str
     wiki_query_timeout_seconds: float
-    welcome_examples: tuple[str, str]
     # Entra (AAD) object IDs of app admins allowed to run protected commands
     # (/sync, /stopsync, /remove, /clean, /lint). These are identifiers, not
     # secrets. An empty set disables all admin commands (fail-closed).
@@ -88,10 +87,6 @@ class Settings:
             ingest_admin_http_url=_read_env("INGEST_ADMIN_HTTP_URL"),
             wiki_query_timeout_seconds=float(
                 _read_env("WIKI_QUERY_TIMEOUT_SECONDS", default="45")
-            ),
-            welcome_examples=(
-                "What is an ETC and how often should I update it?",
-                "What should I do before a dump meeting?",
             ),
             admin_object_ids=_parse_admin_object_ids(_read_env("BOT_ADMIN_OBJECT_IDS")),
             history_max_turns=int(_read_env("BOT_HISTORY_MAX_TURNS", default="6")),

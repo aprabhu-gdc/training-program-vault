@@ -13,12 +13,14 @@ import io
 
 import pytest
 from botbuilder.core import ConversationState, MemoryStorage, UserState
-from botbuilder.schema import Activity, ChannelAccount, ConversationAccount
+from botbuilder.schema import Activity, Attachment, ChannelAccount, ConversationAccount
 from PIL import Image
 
 import teams_bot.bot as bot_module
+from packages.contracts.query import QueryAttachment, QueryResponse
 from teams_bot.bot import GraydazeTrainingBot
 from teams_bot.config import Settings
+from teams_bot.services.session_images import SessionImageStore
 
 
 # --- helpers ---------------------------------------------------------------
@@ -35,7 +37,6 @@ def _settings(**overrides) -> Settings:
         wiki_query_http_url="",
         ingest_admin_http_url="http://localhost:8010",
         wiki_query_timeout_seconds=5.0,
-        welcome_examples=("a", "b"),
     )
     base.update(overrides)
     return Settings(**base)
@@ -281,3 +282,184 @@ async def test_recent_follow_up_keeps_history(monkeypatch):
     ctx2 = FakeTurnContext()
     history = await bot._load_session_history(ctx2)
     assert [t.text for t in history] == ["q1", "a1"]
+
+
+# --- session image memory (SessionImageStore) -------------------------------
+
+
+def _image_attachment(name: str = "p.png") -> QueryAttachment:
+    return QueryAttachment(
+        name=name, content_type="image/png", image_data_url=f"data:image/png;base64,{name}"
+    )
+
+
+def test_session_image_store_remembers_newest_within_idle():
+    store = SessionImageStore(max_images=2)
+    store.remember(
+        "k", [_image_attachment("a"), _image_attachment("b"), _image_attachment("c")], now=100.0
+    )
+    got = store.recent("k", idle_seconds=1800, now=110.0)
+    assert [a.name for a in got] == ["b", "c"]  # only the newest two kept
+
+
+def test_session_image_store_ignores_non_images():
+    store = SessionImageStore()
+    text_only = QueryAttachment(name="n.txt", content_type="text/plain", text_content="hi")
+    store.remember("k", [text_only], now=100.0)
+    assert store.recent("k", idle_seconds=1800, now=101.0) == []
+
+
+def test_session_image_store_expires_after_idle_gap():
+    store = SessionImageStore()
+    store.remember("k", [_image_attachment()], now=100.0)
+    assert store.recent("k", idle_seconds=1800, now=100.0 + 1801) == []
+    # Second read confirms the stale entry was evicted, not just filtered.
+    assert store.recent("k", idle_seconds=1800, now=100.0 + 1) == []
+
+
+def test_session_image_store_refreshes_timestamp_on_access():
+    store = SessionImageStore()
+    store.remember("k", [_image_attachment()], now=0.0)
+    # Each access under the window slides the expiry forward, so a steady drip
+    # of follow-ups keeps the image alive well past the raw idle_seconds.
+    assert store.recent("k", idle_seconds=100, now=90.0)
+    assert store.recent("k", idle_seconds=100, now=180.0)
+    assert store.recent("k", idle_seconds=100, now=270.0)
+
+
+def test_session_image_store_clear():
+    store = SessionImageStore()
+    store.remember("k", [_image_attachment()], now=0.0)
+    store.clear("k")
+    assert store.recent("k", idle_seconds=100, now=1.0) == []
+
+
+# --- carry-forward wiring in on_message_activity ----------------------------
+
+
+class _CapturingWikiService:
+    def __init__(self) -> None:
+        self.requests: list = []
+
+    async def query(self, request):
+        self.requests.append(request)
+        return QueryResponse(answer_text="ok")
+
+
+class _FakeConceptMap:
+    def mapping(self):
+        return {}
+
+
+class _FakeAnalytics:
+    def record_query(self, **kwargs):
+        async def _noop():
+            return None
+
+        return _noop()
+
+
+class _AnswerTurnContext:
+    """Turn context rich enough to drive on_message_activity end-to-end."""
+
+    def __init__(self, *, text, attachments=None, conversation_id="conv-1", channel_id="msteams"):
+        self.activity = Activity(
+            type="message",
+            text=text,
+            attachments=attachments or [],
+            from_property=ChannelAccount(id="29:user", name="Pat"),
+            conversation=ConversationAccount(id=conversation_id),
+            channel_id=channel_id,
+            recipient=ChannelAccount(id="28:bot", name="Bot"),
+        )
+        self.turn_state: dict = {}
+        self.sent: list = []
+
+    async def send_activity(self, activity):
+        self.sent.append(activity)
+        return type("Resp", (), {"id": "act-1"})()
+
+
+async def test_image_is_carried_into_a_text_only_follow_up(monkeypatch):
+    storage = MemoryStorage()
+    wiki = _CapturingWikiService()
+    bot = GraydazeTrainingBot(
+        settings=_settings(session_idle_minutes=30),
+        user_state=UserState(storage),
+        conversation_state=ConversationState(storage),
+        wiki_query_service=wiki,
+        feedback_logger=object(),
+        ingest_admin_client=object(),
+        analytics=_FakeAnalytics(),
+        concept_map=_FakeConceptMap(),
+    )
+
+    image = QueryAttachment(
+        name="bowl.jpg", content_type="image/jpeg", image_data_url="data:image/jpeg;base64,ABC"
+    )
+
+    # Turn 1: an image with a question. Bypass the network download path so the
+    # test exercises only the remember/carry-forward wiring.
+    async def _extract_with_image(_attachments):
+        return (image,), ()
+
+    monkeypatch.setattr(bot, "_extract_query_attachments", _extract_with_image)
+    ctx1 = _AnswerTurnContext(
+        text="How is this relevant?",
+        attachments=[Attachment(content_type="image/jpeg", content_url="https://smba.trafficmanager.net/x")],
+    )
+    await bot.on_message_activity(ctx1)
+
+    # Turn 2: a text-only follow-up, no new attachment.
+    async def _extract_empty(_attachments):
+        return (), ()
+
+    monkeypatch.setattr(bot, "_extract_query_attachments", _extract_empty)
+    ctx2 = _AnswerTurnContext(text="What was in the photo I attached?")
+    await bot.on_message_activity(ctx2)
+
+    assert len(wiki.requests) == 2
+    follow_up = wiki.requests[1]
+    assert any(a.image_data_url == image.image_data_url for a in follow_up.attachments)
+
+
+async def test_image_not_carried_after_idle_gap(monkeypatch):
+    storage = MemoryStorage()
+    wiki = _CapturingWikiService()
+    bot = GraydazeTrainingBot(
+        settings=_settings(session_idle_minutes=30),
+        user_state=UserState(storage),
+        conversation_state=ConversationState(storage),
+        wiki_query_service=wiki,
+        feedback_logger=object(),
+        ingest_admin_client=object(),
+        analytics=_FakeAnalytics(),
+        concept_map=_FakeConceptMap(),
+    )
+
+    image = QueryAttachment(
+        name="bowl.jpg", content_type="image/jpeg", image_data_url="data:image/jpeg;base64,ABC"
+    )
+
+    async def _extract_with_image(_attachments):
+        return (image,), ()
+
+    monkeypatch.setattr(bot, "_extract_query_attachments", _extract_with_image)
+    monkeypatch.setattr(bot_module.time, "time", lambda: 1_000.0)
+    ctx1 = _AnswerTurnContext(
+        text="How is this relevant?",
+        attachments=[Attachment(content_type="image/jpeg", content_url="https://smba.trafficmanager.net/x")],
+    )
+    await bot.on_message_activity(ctx1)
+
+    async def _extract_empty(_attachments):
+        return (), ()
+
+    monkeypatch.setattr(bot, "_extract_query_attachments", _extract_empty)
+    # Jump past the idle window: the image should no longer be carried forward.
+    monkeypatch.setattr(bot_module.time, "time", lambda: 1_000.0 + 31 * 60)
+    ctx2 = _AnswerTurnContext(text="What was in the photo I attached?")
+    await bot.on_message_activity(ctx2)
+
+    assert len(wiki.requests) == 2
+    assert wiki.requests[1].attachments == ()

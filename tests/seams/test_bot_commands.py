@@ -31,7 +31,6 @@ def _bot(admin_ids=frozenset()):
         wiki_query_http_url="",
         ingest_admin_http_url="http://localhost:8010",
         wiki_query_timeout_seconds=5.0,
-        welcome_examples=("a", "b"),
         admin_object_ids=admin_ids,
     )
     storage = MemoryStorage()

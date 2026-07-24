@@ -22,7 +22,6 @@ def _settings(**over) -> Settings:
         wiki_query_http_url="",
         ingest_admin_http_url="http://localhost:8010",
         wiki_query_timeout_seconds=45.0,
-        welcome_examples=("a", "b"),
     )
     base.update(over)
     return Settings(**base)
