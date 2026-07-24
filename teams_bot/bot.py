@@ -9,6 +9,7 @@ import logging
 import mimetypes
 import re
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -18,9 +19,10 @@ import aiohttp
 from botbuilder.core import ConversationState, TurnContext, UserState
 from botbuilder.core.teams import TeamsActivityHandler
 from botbuilder.schema import Activity, ActivityTypes, Attachment, InvokeResponse
+from botframework.connector.auth import MicrosoftAppCredentials
 
 from packages.contracts.identity import CallerIdentity
-from packages.contracts.query import QueryAttachment, QueryRequest
+from packages.contracts.query import ConversationTurn, QueryAttachment, QueryRequest
 from packages.shared.documents.extract_text import SUPPORTED_EXTENSIONS, extract_text
 from teams_bot.cards import (
     build_admin_confirm_card,
@@ -50,6 +52,17 @@ from teams_bot.services.wiki_query import (
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+# Azure/OpenAI vision accepts only these image types; anything else (HEIC/HEIF,
+# bmp, tiff, ...) is transcoded to JPEG before it reaches the model.
+_WEB_NATIVE_IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+# Longest-edge cap: downscaling large photos keeps the base64 request small.
+_MAX_IMAGE_EDGE = 2000
+# Hosts whose attachment URLs are served by the Bot Connector and therefore need
+# the bot's bearer token. SharePoint/OneDrive downloadUrls (paperclip uploads)
+# are pre-authenticated and must NOT receive the token, so they are excluded.
+_BOT_ATTACHMENT_HOST_SUFFIXES = ("botframework.com", "trafficmanager.net", "skype.com")
 
 
 class GraydazeTrainingBot(TeamsActivityHandler):
@@ -86,6 +99,14 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         # Use a simple boolean property rather than a custom object so the state
         # remains JSON-serializable across real storage providers.
         self._welcome_accessor = self._user_state.create_property("HasSeenWelcome")
+        # Short-term, per-conversation chat memory. Stored as a plain dict
+        # ({"updated_at": epoch, "turns": [{"role", "text"}]}) so it stays
+        # JSON-serializable, and kept text-only (never attachment/image blobs).
+        self._history_accessor = self._conversation_state.create_property("History")
+        # Credentials for downloading Bot Connector-hosted attachments (e.g.
+        # pasted/inline images), which require the bot's bearer token. None when
+        # app creds are absent (local Emulator) — downloads then run anonymously.
+        self._app_credentials = self._build_app_credentials(settings)
 
     async def on_turn(self, turn_context: TurnContext) -> None:
         """Run the normal activity pipeline and then persist bot state changes."""
@@ -170,6 +191,8 @@ class GraydazeTrainingBot(TeamsActivityHandler):
                 )
                 return
 
+            session_history = await self._load_session_history(turn_context)
+
             request_id = uuid.uuid4().hex[:12]
             request = QueryRequest(
                 request_id=request_id,
@@ -187,6 +210,7 @@ class GraydazeTrainingBot(TeamsActivityHandler):
                 ),
                 attachments=query_attachments,
                 client_context={"channel_data": turn_context.activity.channel_data},
+                history=tuple(session_history),
             )
 
             # Log the query's length, not its text: question content is user data
@@ -224,6 +248,13 @@ class GraydazeTrainingBot(TeamsActivityHandler):
                 ],
             )
             await turn_context.send_activity(answer_activity)
+            # Remember only what the user actually saw (delivered answer text),
+            # keeping the running session context available for follow-ups.
+            await self._append_session_history(
+                turn_context,
+                user_text=query_text,
+                assistant_text=result.answer_text,
+            )
             self._fire_analytics(
                 self._analytics.record_query(
                     request_id=request.request_id,
@@ -329,6 +360,86 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         )
         await turn_context.send_activity(welcome_text)
         await self._welcome_accessor.set(turn_context, True)
+
+    # --- Conversation memory (in-process, per-conversation) ------------------
+
+    async def _load_session_history(self, turn_context: TurnContext) -> list[ConversationTurn]:
+        """Return recent turns for this conversation, or [] if the session is idle.
+
+        A "session" ends after ``session_idle_minutes`` of inactivity: stale
+        history is dropped so an unrelated later question starts clean.
+        """
+
+        record = await self._history_accessor.get(turn_context, None)
+        if not isinstance(record, dict) or not isinstance(record.get("turns"), list):
+            return []
+
+        updated_at = record.get("updated_at")
+        idle_limit = self._settings.session_idle_minutes * 60.0
+        if (
+            idle_limit > 0
+            and isinstance(updated_at, (int, float))
+            and (time.time() - updated_at) > idle_limit
+        ):
+            await self._history_accessor.set(turn_context, {"updated_at": time.time(), "turns": []})
+            return []
+
+        turns: list[ConversationTurn] = []
+        for item in record["turns"]:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip().lower()
+            text = str(item.get("text") or "").strip()
+            if role in {"user", "assistant"} and text:
+                turns.append(ConversationTurn(role=role, text=text))
+        return turns
+
+    async def _append_session_history(
+        self,
+        turn_context: TurnContext,
+        *,
+        user_text: str,
+        assistant_text: str,
+    ) -> None:
+        """Append the just-completed exchange and trim to the configured caps."""
+
+        record = await self._history_accessor.get(turn_context, None)
+        turns: list[dict[str, str]] = []
+        if isinstance(record, dict) and isinstance(record.get("turns"), list):
+            turns = [item for item in record["turns"] if isinstance(item, dict)]
+
+        user_text = (user_text or "").strip()
+        assistant_text = (assistant_text or "").strip()
+        if user_text:
+            turns.append({"role": "user", "text": user_text})
+        if assistant_text:
+            turns.append({"role": "assistant", "text": assistant_text})
+
+        await self._history_accessor.set(
+            turn_context,
+            {"updated_at": time.time(), "turns": self._trim_history(turns)},
+        )
+
+    def _trim_history(self, turns: list[dict[str, str]]) -> list[dict[str, str]]:
+        """Cap history by turn count, then by total character budget (recent-first)."""
+
+        max_turns = max(0, self._settings.history_max_turns)
+        if max_turns and len(turns) > max_turns:
+            turns = turns[-max_turns:]
+
+        budget = max(0, self._settings.history_char_budget)
+        if not budget:
+            return turns
+
+        kept: list[dict[str, str]] = []
+        running = 0
+        for turn in reversed(turns):
+            length = len(str(turn.get("text") or ""))
+            if kept and running + length > budget:
+                break
+            running += length
+            kept.append(turn)
+        return list(reversed(kept))
 
     async def _handle_feedback(self, turn_context: TurnContext) -> None:
         """Log user feedback from the Adaptive Card buttons and acknowledge it."""
@@ -489,11 +600,19 @@ class GraydazeTrainingBot(TeamsActivityHandler):
             return None
 
         if self._is_image_attachment(name=name, content_type=content_type):
-            image_content_type = content_type or mimetypes.guess_type(name)[0] or "image/png"
+            prepared = self._prepare_image(payload=payload, name=name, content_type=content_type)
+            if prepared is None:
+                LOGGER.info(
+                    "Skipping image we couldn't prepare for the vision model name=%s content_type=%s",
+                    name,
+                    content_type,
+                )
+                return None
+            image_bytes, image_content_type = prepared
             return QueryAttachment(
                 name=name,
                 content_type=image_content_type,
-                image_data_url=self._to_data_url(payload, image_content_type),
+                image_data_url=self._to_data_url(image_bytes, image_content_type),
             )
 
         extracted_text = await self._extract_attachment_text(
@@ -511,11 +630,56 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         )
 
     async def _download_attachment(self, download_url: str) -> bytes:
+        headers: dict[str, str] = {}
+        if self._app_credentials is not None and self._requires_bot_token(download_url):
+            # Inline/pasted Teams images live behind the Bot Connector and 401
+            # without the bot token. SharePoint downloadUrls are excluded by host.
+            try:
+                MicrosoftAppCredentials.trust_service_url(download_url)
+                token = await asyncio.to_thread(self._app_credentials.get_access_token)
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+            except Exception:
+                LOGGER.warning(
+                    "Failed to obtain bot token for attachment download; retrying anonymously",
+                    exc_info=True,
+                )
+
         timeout = aiohttp.ClientTimeout(total=self._settings.wiki_query_timeout_seconds)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(download_url) as response:
+            async with session.get(download_url, headers=headers) as response:
                 response.raise_for_status()
                 return await response.read()
+
+    @staticmethod
+    def _build_app_credentials(settings: Settings) -> MicrosoftAppCredentials | None:
+        """Build connector credentials from the bot's app id/password, if present."""
+
+        if not settings.app_id or not settings.app_password:
+            return None
+        try:
+            tenant = (
+                settings.app_tenant_id
+                if settings.app_type.strip().lower() == "singletenant"
+                else None
+            )
+            return MicrosoftAppCredentials(
+                settings.app_id, settings.app_password, channel_auth_tenant=tenant or None
+            )
+        except Exception:
+            LOGGER.warning(
+                "Could not build MicrosoftAppCredentials; attachment downloads will be anonymous",
+                exc_info=True,
+            )
+            return None
+
+    @staticmethod
+    def _requires_bot_token(url: str) -> bool:
+        host = (urlsplit(url).hostname or "").lower()
+        return any(
+            host == suffix or host.endswith("." + suffix)
+            for suffix in _BOT_ATTACHMENT_HOST_SUFFIXES
+        )
 
     async def _extract_attachment_text(
         self,
@@ -578,8 +742,96 @@ class GraydazeTrainingBot(TeamsActivityHandler):
     def _is_image_attachment(*, name: str, content_type: str) -> bool:
         if content_type.startswith("image/"):
             return True
+        # .heic/.heif are common phone-photo formats that Python's mimetypes DB
+        # often doesn't map, so detect them explicitly.
+        if Path(name).suffix.lower() in {".heic", ".heif"}:
+            return True
         guessed, _encoding = mimetypes.guess_type(name)
         return bool(guessed and guessed.startswith("image/"))
+
+    def _prepare_image(
+        self,
+        *,
+        payload: bytes,
+        name: str,
+        content_type: str,
+    ) -> tuple[bytes, str] | None:
+        """Normalize an image for the vision model.
+
+        Returns ``(bytes, content_type)`` ready to send, or ``None`` when the
+        image can't be made model-ready (e.g. HEIC with no transcoder available).
+        png/jpeg/gif/webp within the size cap pass through untouched; everything
+        else (HEIC/HEIF, bmp, tiff, oversized photos) is transcoded/downscaled.
+        """
+
+        normalized_type = (content_type or "").split(";")[0].strip().lower()
+        if not normalized_type or normalized_type == "application/octet-stream":
+            normalized_type = (mimetypes.guess_type(name)[0] or "").lower()
+
+        suffix = Path(name).suffix.lower()
+        needs_transcode = (
+            suffix in {".heic", ".heif"}
+            or normalized_type not in _WEB_NATIVE_IMAGE_TYPES
+        )
+
+        processed = self._process_image_bytes(payload, force_jpeg=needs_transcode)
+        if processed is not None:
+            return processed
+
+        # Pillow unavailable or failed. A web-native format can still be sent
+        # as-is; anything requiring transcode has to be skipped.
+        if not needs_transcode and normalized_type in _WEB_NATIVE_IMAGE_TYPES:
+            return payload, normalized_type
+        return None
+
+    @staticmethod
+    def _process_image_bytes(payload: bytes, *, force_jpeg: bool) -> tuple[bytes, str] | None:
+        """Decode, optionally downscale, and re-encode an image via Pillow.
+
+        Returns ``None`` to mean "no processing applied" — either the source is
+        already an acceptable web-native image within the size cap, or Pillow
+        (and the HEIF plugin) isn't available. Callers treat ``None`` per their
+        own fallback rules.
+        """
+
+        try:
+            import io
+
+            from PIL import Image
+
+            try:  # HEIC/HEIF support is an optional plugin.
+                import pillow_heif
+
+                pillow_heif.register_heif_opener()
+            except Exception:  # pragma: no cover - only when plugin missing
+                pass
+
+            with Image.open(io.BytesIO(payload)) as image:
+                image.load()
+                fmt = (image.format or "").upper()
+                width, height = image.size
+                longest = max(width, height)
+                needs_resize = longest > _MAX_IMAGE_EDGE
+                already_web = fmt in {"PNG", "JPEG", "GIF", "WEBP"}
+
+                if already_web and not force_jpeg and not needs_resize:
+                    return None  # pass the original bytes through unchanged
+
+                if needs_resize:
+                    scale = _MAX_IMAGE_EDGE / float(longest)
+                    image = image.resize(
+                        (max(1, int(width * scale)), max(1, int(height * scale)))
+                    )
+
+                buffer = io.BytesIO()
+                if force_jpeg or fmt not in {"PNG", "GIF", "WEBP"}:
+                    image.convert("RGB").save(buffer, format="JPEG", quality=85)
+                    return buffer.getvalue(), "image/jpeg"
+                image.save(buffer, format=fmt)
+                return buffer.getvalue(), f"image/{fmt.lower()}"
+        except Exception:
+            LOGGER.warning("Image processing failed; falling back", exc_info=True)
+            return None
 
     @staticmethod
     def _to_data_url(payload: bytes, content_type: str) -> str:

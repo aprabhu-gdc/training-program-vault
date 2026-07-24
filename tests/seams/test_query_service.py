@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from packages.contracts.identity import CallerIdentity
-from packages.contracts.query import QueryRequest
+from packages.contracts.query import ConversationTurn, QueryRequest
 from packages.wiki_core.retrieval.query_service import QueryService
 
 
@@ -59,14 +59,17 @@ class FakeGateway:
         self.captured["embed_texts"] = list(texts)
         return [[0.1, 0.2, 0.3]]
 
-    async def complete_text(self, *, system_prompt, user_prompt, temperature=0.1, requires_vision=False):
+    async def complete_text(
+        self, *, system_prompt, user_prompt, temperature=0.1, requires_vision=False, history=None
+    ):
         self.captured["system_prompt"] = system_prompt
         self.captured["user_prompt"] = user_prompt
         self.captured["requires_vision"] = requires_vision
+        self.captured["history"] = history
         return self.answer
 
 
-def _request(query="How do I start a job?"):
+def _request(query="How do I start a job?", history=()):
     return QueryRequest(
         request_id="req-1",
         query=query,
@@ -74,6 +77,7 @@ def _request(query="How do I start a job?"):
             user_id=None, user_name=None, tenant_id=None, client_app="test",
             channel_id=None, conversation_id=None, locale=None,
         ),
+        history=tuple(history),
     )
 
 
@@ -119,6 +123,31 @@ async def test_query_passes_retrieved_context_into_prompt(core_settings):
     # The retrieved chunk text must reach the model's user prompt.
     assert "Relevant content about the topic." in service._model_gateway.captured["user_prompt"]
     assert service._model_gateway.captured["requires_vision"] is False
+
+
+async def test_history_reaches_gateway_and_strengthens_retrieval(core_settings):
+    history = (
+        ConversationTurn(role="user", text="Tell me about ETC"),
+        ConversationTurn(role="assistant", text="ETC is estimate to complete."),
+    )
+    service = _service(core_settings, [ROW])
+    await service.query(_request(query="How often should I update it?", history=history))
+
+    # Prior turns are handed to the model as chat messages (oldest first).
+    assert service._model_gateway.captured["history"] == [
+        {"role": "user", "content": "Tell me about ETC"},
+        {"role": "assistant", "content": "ETC is estimate to complete."},
+    ]
+    # The earlier user question is folded into the retrieval query so a short
+    # follow-up still retrieves the right chunks.
+    retrieval_query = service._model_gateway.captured["embed_texts"][0]
+    assert "Earlier question: Tell me about ETC" in retrieval_query
+
+
+async def test_no_history_sends_empty_message_list(core_settings):
+    service = _service(core_settings, [ROW])
+    await service.query(_request())
+    assert service._model_gateway.captured["history"] == []
 
 
 async def test_query_no_results_returns_fallback(core_settings):

@@ -177,6 +177,7 @@ class WikiQueryService:
             "locale": request.identity.locale,
             "channel_data": request.client_context.get("channel_data"),
             "attachments": request.attachments,
+            "history": request.history,
         }
 
         args: list[Any] = []
@@ -283,6 +284,7 @@ class HttpWikiQueryService:
             "tenant_id": request.identity.tenant_id,
             "locale": request.identity.locale,
             "attachments": [asdict(attachment) for attachment in request.attachments],
+            "history": [asdict(turn) for turn in request.history],
         }
 
         timeout = aiohttp.ClientTimeout(total=self._timeout_seconds)

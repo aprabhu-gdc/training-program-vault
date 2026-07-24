@@ -17,6 +17,7 @@ class ModelGateway(Protocol):
         user_prompt: str | list[dict[str, Any]],
         temperature: float = 0.1,
         requires_vision: bool = False,
+        history: list[dict[str, Any]] | None = None,
     ) -> str: ...
 
     def complete_json(

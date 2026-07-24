@@ -26,6 +26,7 @@ class LegacyProviderGateway:
         user_prompt: str | list[dict[str, Any]],
         temperature: float = 0.1,
         requires_vision: bool = False,
+        history: list[dict[str, Any]] | None = None,
     ) -> str:
         return await complete_text_async(
             system_prompt=system_prompt,
@@ -33,6 +34,7 @@ class LegacyProviderGateway:
             settings=self._settings,
             temperature=temperature,
             requires_vision=requires_vision,
+            history=history,
         )
 
     def complete_json(
