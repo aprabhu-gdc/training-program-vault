@@ -153,7 +153,6 @@ def _bot(analytics, feedback_logger):
         wiki_query_http_url="",
         ingest_admin_http_url="http://localhost:8010",
         wiki_query_timeout_seconds=5.0,
-        welcome_examples=("a", "b"),
     )
     storage = MemoryStorage()
     return GraydazeTrainingBot(

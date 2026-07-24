@@ -43,6 +43,7 @@ from teams_bot.services.concept_labels import concept_label
 from teams_bot.services.feedback import FeedbackEvent, FeedbackLogger
 from teams_bot.services.ingest_admin_client import HttpIngestAdminClient
 from teams_bot.services.pending_actions import PendingActionStore
+from teams_bot.services.session_images import SessionImageStore
 from teams_bot.services.source_links import SourceLinkResolver
 from teams_bot.services.sync_monitor import SyncProgressMonitor
 from teams_bot.services.wiki_query import (
@@ -96,13 +97,14 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         self._source_links = SourceLinkResolver()
         # Destructive admin actions await confirmation here (in-memory, TTL'd).
         self._pending_actions = PendingActionStore()
-        # Use a simple boolean property rather than a custom object so the state
-        # remains JSON-serializable across real storage providers.
-        self._welcome_accessor = self._user_state.create_property("HasSeenWelcome")
         # Short-term, per-conversation chat memory. Stored as a plain dict
         # ({"updated_at": epoch, "turns": [{"role", "text"}]}) so it stays
         # JSON-serializable, and kept text-only (never attachment/image blobs).
         self._history_accessor = self._conversation_state.create_property("History")
+        # The most recent image(s) per conversation, held in process memory (not
+        # in ConversationState) so a follow-up turn can re-send them to the
+        # vision model. Reset after the same idle gap as the text history.
+        self._session_images = SessionImageStore()
         # Credentials for downloading Bot Connector-hosted attachments (e.g.
         # pasted/inline images), which require the bot's bearer token. None when
         # app creds are absent (local Emulator) — downloads then run anonymously.
@@ -114,20 +116,6 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         await super().on_turn(turn_context)
         await self._conversation_state.save_changes(turn_context, force=False)
         await self._user_state.save_changes(turn_context, force=False)
-
-    async def on_members_added_activity(
-        self,
-        members_added,
-        turn_context: TurnContext,
-    ) -> None:
-        """Send the welcome message when the bot is installed or a chat starts."""
-
-        bot_id = turn_context.activity.recipient.id if turn_context.activity.recipient else None
-
-        for member in members_added:
-            if member.id != bot_id:
-                await self._send_welcome_if_needed(turn_context)
-                break
 
     async def on_message_activity(self, turn_context: TurnContext) -> None:
         """Handle a user message, send typing indicators, then answer via the wiki."""
@@ -156,8 +144,6 @@ class GraydazeTrainingBot(TeamsActivityHandler):
         typing_task = asyncio.create_task(self._typing_loop(turn_context))
 
         try:
-            await self._send_welcome_if_needed(turn_context)
-
             incoming_attachments = [
                 attachment
                 for attachment in (turn_context.activity.attachments or [])
@@ -191,6 +177,23 @@ class GraydazeTrainingBot(TeamsActivityHandler):
                 )
                 return
 
+            # Short-term image memory: remember a freshly attached image, or (on a
+            # text-only follow-up within the active session) re-send the most
+            # recent one so the vision model can still "see" it.
+            now = time.time()
+            conversation_key = self._conversation_key(turn_context)
+            new_images = [a for a in query_attachments if a.image_data_url]
+            effective_attachments = list(query_attachments)
+            if new_images:
+                self._session_images.remember(conversation_key, new_images, now=now)
+            else:
+                carried = self._session_images.recent(
+                    conversation_key,
+                    idle_seconds=self._settings.session_idle_minutes * 60.0,
+                    now=now,
+                )
+                effective_attachments.extend(carried)
+
             session_history = await self._load_session_history(turn_context)
 
             request_id = uuid.uuid4().hex[:12]
@@ -208,7 +211,7 @@ class GraydazeTrainingBot(TeamsActivityHandler):
                     ),
                     locale=turn_context.activity.locale,
                 ),
-                attachments=query_attachments,
+                attachments=tuple(effective_attachments),
                 client_context={"channel_data": turn_context.activity.channel_data},
                 history=tuple(session_history),
             )
@@ -349,26 +352,20 @@ class GraydazeTrainingBot(TeamsActivityHandler):
 
         return await super().on_invoke_activity(turn_context)
 
-    async def _send_welcome_if_needed(self, turn_context: TurnContext) -> None:
-        """Send the first-run welcome exactly once per user state record."""
-
-        has_seen_welcome = await self._welcome_accessor.get(turn_context, False)
-        if has_seen_welcome:
-            return
-
-        welcome_text = (
-            "Hi, I’m the **Graydaze PM Training Vault**. I can answer questions from the company’s PM "
-            "training materials right inside Teams.\n\n"
-            "Try asking:\n"
-            f"- {self._settings.welcome_examples[0]}\n"
-            f"- {self._settings.welcome_examples[1]}\n\n"
-            "_Privacy note: to improve the training program, we log which topics are asked "
-            "about and any feedback you submit — never the text of your questions or answers._"
-        )
-        await turn_context.send_activity(welcome_text)
-        await self._welcome_accessor.set(turn_context, True)
-
     # --- Conversation memory (in-process, per-conversation) ------------------
+
+    @staticmethod
+    def _conversation_key(turn_context: TurnContext) -> str:
+        """Stable per-conversation key (channel + conversation id).
+
+        Mirrors how ``ConversationState`` scopes the text history so the image
+        memory and the text memory share the same conversation boundary.
+        """
+
+        activity = turn_context.activity
+        channel = activity.channel_id or ""
+        conversation = activity.conversation.id if activity.conversation else ""
+        return f"{channel}:{conversation}"
 
     async def _load_session_history(self, turn_context: TurnContext) -> list[ConversationTurn]:
         """Return recent turns for this conversation, or [] if the session is idle.

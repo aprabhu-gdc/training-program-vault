@@ -60,11 +60,17 @@ async def test_build_index_then_query_returns_grounded_answer(isolated_live_sett
     )
     response = await service.query(request)
 
-    # 3. Assert a grounded, cited answer came back.
+    # 3. Assert a grounded, cited answer came back. Grounding is conveyed through
+    # the structured citations (shown to the user as a separate Sources card), not
+    # inline "[Source: ...]" markers — the system prompt forbids those and
+    # query_service strips any that slip through.
     assert response.answer_text.strip(), "empty answer text"
+    assert "[Source:" not in response.answer_text, (
+        "answer leaked inline source tags the system prompt forbids. "
+        f"Got: {response.answer_text[:300]!r}"
+    )
     assert response.citations, "no citations returned"
-    assert "[Source:" in response.answer_text, (
-        "answer is missing the [Source: Title] grounding markers required by the "
-        f"system prompt. Got: {response.answer_text[:300]!r}"
+    assert any(c.title and c.path for c in response.citations), (
+        "citations are missing title/path grounding metadata"
     )
     assert response.retrieval_diagnostics.get("chunk_ids"), "no retrieval diagnostics"
