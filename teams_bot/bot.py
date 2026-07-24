@@ -201,14 +201,21 @@ class GraydazeTrainingBot(TeamsActivityHandler):
 
             result = await self._wiki_query_service.query(request)
 
-            # The map build reads the whole wiki on a cold/expired cache, so it
-            # runs off the event loop. mapping() is fail-soft and never raises.
-            source_concepts = await asyncio.to_thread(self._concept_map.mapping)
             diagnostics = getattr(result, "retrieval_diagnostics", None) or {}
+            concept_candidates = diagnostics.get("concept_candidates")
+            # The source->concept map is only the fallback derive_concept uses
+            # when retrieval surfaced no concept candidates; when candidates are
+            # present it's ignored. Building it eagerly blocked the reply on a
+            # cold/expired cache with a full-wiki read whose result was then
+            # discarded, so build it lazily. mapping() is fail-soft and reads the
+            # whole wiki, so it still runs off the event loop when it does run.
+            source_concepts = None
+            if not concept_candidates:
+                source_concepts = await asyncio.to_thread(self._concept_map.mapping)
             match = derive_concept(
                 getattr(result, "citations", ()),
                 source_concepts,
-                concept_candidates=diagnostics.get("concept_candidates"),
+                concept_candidates=concept_candidates,
             )
             label = concept_label(match.title, match.path)
             answer_activity = Activity(
