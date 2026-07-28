@@ -2,9 +2,8 @@
 
 This is a deliberate sibling of ``SharePointSourceSyncAdapter`` rather than an
 extension of it: the sync adapter validates drive/webhook configuration this
-client does not need, and it caches its app-only token forever (safe only for
-short-lived adapter instances). Analytics clients live for the whole bot
-process, so the token here is cached with its expiry and refreshed on demand.
+client does not need. Both live for the whole process, so both cache the
+app-only token with its expiry and refresh it on demand (and on a 401).
 
 Privacy note: rows written through this client must never contain a user's
 question or the bot's answer text — only concept titles, identity fields, and

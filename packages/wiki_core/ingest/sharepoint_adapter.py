@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,11 @@ LOGGER = logging.getLogger(__name__)
 # expiry. Default to 24h and let callers renew at half-life.
 DEFAULT_SUBSCRIPTION_LIFETIME_MINUTES = 60 * 24
 
+# Refresh the app-only token this many seconds before Graph says it expires.
+# Kept local to this module: the analytics client is a deliberate sibling, not a
+# shared base class, and the two are free to tune this independently.
+TOKEN_EXPIRY_BUFFER_SECONDS = 300
+
 
 class SharePointSourceSyncAdapter:
     GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
@@ -31,6 +37,7 @@ class SharePointSourceSyncAdapter:
         self._settings.validate_source_sync()
         self._timeout = httpx.Timeout(self._settings.sharepoint_request_timeout_seconds)
         self._access_token = ""
+        self._token_expires_at = 0.0
         self._resolved_site_id = self._settings.sharepoint_site_id.strip()
         self._configured_list_id = self._settings.sharepoint_list_id.strip()
         self._resolved_drive_id = self._settings.sharepoint_drive_id.strip()
@@ -45,7 +52,7 @@ class SharePointSourceSyncAdapter:
 
         expected_client_state = self._settings.sharepoint_webhook_client_state
         events: list[SourceFileEvent] = []
-        with httpx.Client(timeout=self._timeout, headers=self._authorized_headers()) as client:
+        with self._client() as client:
             for notification in notifications:
                 if not isinstance(notification, dict):
                     continue
@@ -87,7 +94,7 @@ class SharePointSourceSyncAdapter:
 
     def _fetch_drive_item(self, client: httpx.Client, item_id: str) -> dict[str, Any] | None:
         url = f"{self.GRAPH_BASE_URL}/drives/{self._drive_id()}/items/{item_id}"
-        response = client.get(url)
+        response = self._request("GET", url, client=client)
         if response.status_code == 404:
             LOGGER.info("SharePoint webhook references missing item id=%s", item_id)
             return None
@@ -117,12 +124,9 @@ class SharePointSourceSyncAdapter:
             "expirationDateTime": expiry,
             "clientState": client_state,
         }
-        headers = dict(self._authorized_headers())
-        headers["Content-Type"] = "application/json"
-        with httpx.Client(timeout=self._timeout, headers=headers) as client:
-            response = client.post(f"{self.GRAPH_BASE_URL}/subscriptions", json=body)
-            response.raise_for_status()
-            payload = response.json()
+        response = self._request_once("POST", f"{self.GRAPH_BASE_URL}/subscriptions", json=body)
+        response.raise_for_status()
+        payload = response.json()
         if not isinstance(payload, dict):
             raise ValueError("Microsoft Graph subscription creation returned an unexpected payload.")
         return payload
@@ -136,13 +140,10 @@ class SharePointSourceSyncAdapter:
         if not subscription_id:
             raise ValueError("subscription_id is required to renew a subscription.")
         body = {"expirationDateTime": self._format_expiration(expiration_minutes)}
-        headers = dict(self._authorized_headers())
-        headers["Content-Type"] = "application/json"
         url = f"{self.GRAPH_BASE_URL}/subscriptions/{subscription_id}"
-        with httpx.Client(timeout=self._timeout, headers=headers) as client:
-            response = client.patch(url, json=body)
-            response.raise_for_status()
-            payload = response.json()
+        response = self._request_once("PATCH", url, json=body)
+        response.raise_for_status()
+        payload = response.json()
         if not isinstance(payload, dict):
             raise ValueError("Microsoft Graph subscription renewal returned an unexpected payload.")
         return payload
@@ -152,9 +153,9 @@ class SharePointSourceSyncAdapter:
 
         subscriptions: list[dict[str, Any]] = []
         url: str | None = f"{self.GRAPH_BASE_URL}/subscriptions"
-        with httpx.Client(timeout=self._timeout, headers=self._authorized_headers()) as client:
+        with self._client() as client:
             while url:
-                response = client.get(url)
+                response = self._request("GET", url, client=client)
                 response.raise_for_status()
                 payload = response.json()
                 for item in list(payload.get("value") or []):
@@ -172,11 +173,10 @@ class SharePointSourceSyncAdapter:
         if not subscription_id:
             return
         url = f"{self.GRAPH_BASE_URL}/subscriptions/{subscription_id}"
-        with httpx.Client(timeout=self._timeout, headers=self._authorized_headers()) as client:
-            response = client.delete(url)
-            if response.status_code == 404:
-                return
-            response.raise_for_status()
+        response = self._request_once("DELETE", url)
+        if response.status_code == 404:
+            return
+        response.raise_for_status()
 
     @staticmethod
     def _format_expiration(expiration_minutes: int) -> str:
@@ -205,19 +205,28 @@ class SharePointSourceSyncAdapter:
         if convert_to_pdf:
             download_url += "?format=pdf"
         LOGGER.info("Downloading SharePoint file path=%s destination=%s", remote_path, destination)
-        with httpx.Client(timeout=self._timeout, headers=self._authorized_headers(), follow_redirects=True) as client:
-            with client.stream("GET", download_url) as response:
-                response.raise_for_status()
-                with destination.open("wb") as handle:
-                    for chunk in response.iter_bytes():
-                        handle.write(chunk)
-        return destination
+        with self._client(follow_redirects=True) as client:
+            # Streamed downloads cannot go through _request; do the same
+            # refresh-once-on-401 dance here. The second 401 is fatal.
+            for retry_auth in (True, False):
+                with client.stream("GET", download_url, headers=self._authorized_headers()) as response:
+                    if response.status_code == 401 and retry_auth:
+                        response.read()  # drain the body so the connection can be reused
+                        LOGGER.info("Graph returned 401 on download; refreshing app-only token and retrying once")
+                        self._invalidate_token()
+                        continue
+                    response.raise_for_status()
+                    with destination.open("wb") as handle:
+                        for chunk in response.iter_bytes():
+                            handle.write(chunk)
+                    return destination
+        raise RuntimeError(f"SharePoint download of {remote_path!r} neither completed nor raised.")
 
     def list_files_recursive(self, root_path: str) -> list[SourceFileEvent]:
         files: list[SourceFileEvent] = []
         folders_to_visit = [root_path.strip("/")]
 
-        with httpx.Client(timeout=self._timeout, headers=self._authorized_headers()) as client:
+        with self._client() as client:
             while folders_to_visit:
                 current = folders_to_visit.pop()
                 payload = self._get_children_payload(client, current)
@@ -267,12 +276,11 @@ class SharePointSourceSyncAdapter:
         if normalized == raw_root or normalized.startswith(raw_root + "/"):
             raise ValueError(f"Refusing to delete an immutable raw source path: {remote_path!r}")
 
-        with httpx.Client(timeout=self._timeout, headers=self._authorized_headers()) as client:
-            response = client.delete(self._graph_drive_item_url(normalized))
-            if response.status_code == 404:
-                return False
-            response.raise_for_status()
-            return True
+        response = self._request_once("DELETE", self._graph_drive_item_url(normalized))
+        if response.status_code == 404:
+            return False
+        response.raise_for_status()
+        return True
 
     def delete_wiki_file(self, relative_path: str) -> bool:
         """Delete a ``wiki/...`` page from SharePoint. Returns False if already gone."""
@@ -284,7 +292,7 @@ class SharePointSourceSyncAdapter:
             return
 
         current_parent = ""
-        with httpx.Client(timeout=self._timeout, headers=self._authorized_headers()) as client:
+        with self._client() as client:
             for segment in segments:
                 child_path = "/".join(part for part in (current_parent, segment) if part)
                 if self._remote_item_exists(client, child_path):
@@ -292,8 +300,10 @@ class SharePointSourceSyncAdapter:
                     continue
 
                 url = self._graph_children_url(current_parent)
-                response = client.post(
+                response = self._request(
+                    "POST",
                     url,
+                    client=client,
                     json={
                         "name": segment,
                         "folder": {},
@@ -303,14 +313,81 @@ class SharePointSourceSyncAdapter:
                 response.raise_for_status()
                 current_parent = child_path
 
+    def _client(self, *, follow_redirects: bool = False) -> httpx.Client:
+        """A Graph client with no baked-in auth header.
+
+        Auth is attached per request by ``_request`` so a mid-flight token refresh
+        takes effect immediately, even inside a long request loop that shares one
+        client (e.g. a recursive listing that outlives the token).
+        """
+
+        return httpx.Client(timeout=self._timeout, follow_redirects=follow_redirects)
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        client: httpx.Client,
+        extra_headers: dict[str, str] | None = None,
+        retry_auth: bool = True,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """Issue an authorized Graph request, refreshing the token once on a 401.
+
+        Graph can reject a token before its stated expiry (revocation, tenant
+        policy change), so an expiry check alone is not enough.
+        """
+
+        headers = self._authorized_headers()
+        if extra_headers:
+            headers.update(extra_headers)
+        response = client.request(method, url, headers=headers, **kwargs)
+        if response.status_code == 401 and retry_auth:
+            LOGGER.info("Graph returned 401 for %s; refreshing app-only token and retrying once", method)
+            self._invalidate_token()
+            return self._request(
+                method,
+                url,
+                client=client,
+                extra_headers=extra_headers,
+                retry_auth=False,
+                **kwargs,
+            )
+        return response
+
+    def _request_once(
+        self,
+        method: str,
+        url: str,
+        *,
+        extra_headers: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """``_request`` for a single call that does not share a client."""
+
+        with self._client() as client:
+            return self._request(method, url, client=client, extra_headers=extra_headers, **kwargs)
+
     def _authorized_headers(self) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self._get_access_token()}",
             "Accept": "application/json",
         }
 
+    def _invalidate_token(self) -> None:
+        self._access_token = ""
+        self._token_expires_at = 0.0
+
     def _get_access_token(self) -> str:
-        if self._access_token:
+        """Return a valid app-only token, fetching a new one when it is near expiry.
+
+        This adapter is held for the lifetime of the sync worker and the bot
+        process, so the token must be refreshed on demand — caching it forever
+        makes every Graph call fail with 401 about an hour after startup.
+        """
+
+        if self._access_token and time.monotonic() < self._token_expires_at:
             return self._access_token
 
         token_url = f"https://login.microsoftonline.com/{self._settings.sharepoint_tenant_id}/oauth2/v2.0/token"
@@ -330,7 +407,9 @@ class SharePointSourceSyncAdapter:
         access_token = str(payload.get("access_token") or "").strip()
         if not access_token:
             raise ValueError("Microsoft Graph token response did not include an access_token.")
+        expires_in = float(payload.get("expires_in") or 3600)
         self._access_token = access_token
+        self._token_expires_at = time.monotonic() + max(expires_in - TOKEN_EXPIRY_BUFFER_SECONDS, 60.0)
         return access_token
 
     def _site_id(self) -> str:
@@ -339,10 +418,9 @@ class SharePointSourceSyncAdapter:
 
         site_path = quote(self._settings.normalized_sharepoint_site_path, safe="/")
         url = f"{self.GRAPH_BASE_URL}/sites/{self._settings.sharepoint_site_hostname}:{site_path}"
-        with httpx.Client(timeout=self._timeout, headers=self._authorized_headers()) as client:
-            response = client.get(url)
-            response.raise_for_status()
-            payload = response.json()
+        response = self._request_once("GET", url)
+        response.raise_for_status()
+        payload = response.json()
 
         site_id = str(payload.get("id") or "").strip()
         if not site_id:
@@ -356,10 +434,9 @@ class SharePointSourceSyncAdapter:
 
         if self._configured_list_id:
             url = f"{self.GRAPH_BASE_URL}/sites/{self._site_id()}/lists/{self._configured_list_id}/drive"
-            with httpx.Client(timeout=self._timeout, headers=self._authorized_headers()) as client:
-                response = client.get(url)
-                response.raise_for_status()
-                payload = response.json()
+            response = self._request_once("GET", url)
+            response.raise_for_status()
+            payload = response.json()
 
             drive_id = str(payload.get("id") or "").strip()
             if not drive_id:
@@ -368,10 +445,9 @@ class SharePointSourceSyncAdapter:
             return drive_id
 
         url = f"{self.GRAPH_BASE_URL}/sites/{self._site_id()}/drives"
-        with httpx.Client(timeout=self._timeout, headers=self._authorized_headers()) as client:
-            response = client.get(url)
-            response.raise_for_status()
-            payload = response.json()
+        response = self._request_once("GET", url)
+        response.raise_for_status()
+        payload = response.json()
 
         target_name = self._settings.sharepoint_drive_name.strip().lower()
         for item in list(payload.get("value") or []):
@@ -397,10 +473,9 @@ class SharePointSourceSyncAdapter:
             return self._resolved_drive_web_url
 
         url = f"{self.GRAPH_BASE_URL}/drives/{self._drive_id()}"
-        with httpx.Client(timeout=self._timeout, headers=self._authorized_headers()) as client:
-            response = client.get(url)
-            response.raise_for_status()
-            payload = response.json()
+        response = self._request_once("GET", url)
+        response.raise_for_status()
+        payload = response.json()
 
         web_url = str(payload.get("webUrl") or "").strip()
         if not web_url:
@@ -422,7 +497,7 @@ class SharePointSourceSyncAdapter:
         return self._graph_drive_item_url(normalized_path) + ":/children"
 
     def _get_children_payload(self, client: httpx.Client, folder_path: str) -> dict[str, Any]:
-        response = client.get(self._graph_children_url(folder_path))
+        response = self._request("GET", self._graph_children_url(folder_path), client=client)
         response.raise_for_status()
         payload = response.json()
         if not isinstance(payload, dict):
@@ -461,15 +536,14 @@ class SharePointSourceSyncAdapter:
         if parent and parent != ".":
             self.ensure_remote_folder(parent)
 
-        headers = dict(self._authorized_headers())
-        headers["Content-Type"] = content_type
         url = self._graph_item_content_url(remote_path)
-        with httpx.Client(timeout=self._timeout, headers=headers) as client:
-            response = client.put(url, content=payload)
-            response.raise_for_status()
+        response = self._request_once(
+            "PUT", url, extra_headers={"Content-Type": content_type}, content=payload
+        )
+        response.raise_for_status()
 
     def _remote_item_exists(self, client: httpx.Client, remote_path: str) -> bool:
-        response = client.get(self._graph_drive_item_url(remote_path))
+        response = self._request("GET", self._graph_drive_item_url(remote_path), client=client)
         if response.status_code == 404:
             return False
         response.raise_for_status()
