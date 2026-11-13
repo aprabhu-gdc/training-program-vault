@@ -1,0 +1,13 @@
+# Allowlist: ignore everything, then re-include only what the analytics
+# connector image needs. Keeps .env, certificates, raw/ and wiki/ out of any
+# Docker build context.
+*
+!apps/__init__.py
+!apps/analytics_mcp/
+!packages/
+!teams_bot/__init__.py
+!teams_bot/services/__init__.py
+!teams_bot/services/analytics.py
+!teams_bot/services/concept_labels.py
+**/__pycache__
+**/*.pyc

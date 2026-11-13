@@ -343,6 +343,15 @@ needed), and the worker runs a reconciliation sync every `INGEST_RECONCILE_HOURS
 ingest falls back to manual `/sync` + the scheduled sweep. Durable bot storage
 and org-wide catalog publishing remain deferred to Stage 2.
 
+## Claude Analytics Connector
+
+The PM Training Vault is moving from the Teams bot to a shared Claude project that reads the wiki through the Microsoft 365 connector. Training analytics move to a small custom connector, `apps/analytics_mcp/`, that writes the same `TrainingBotQueryEvents` / `TrainingBotFeedback` rows. The Power BI report keeps working unchanged, and admins get a `get_analytics` tool for a Claude dashboard.
+
+- Setup runbook: `docs/claude-analytics-connector.md`
+- Project instructions to paste into Claude: `docs/claude-project-instructions.md`
+- Infrastructure: `infra/analytics-connector/main.bicep` (Azure Container Apps + Table Storage)
+- CI/CD: `.github/workflows/analytics-connector.yml`
+
 ## Repository Notes
 
 - `raw/` is intentionally git-ignored and should remain untracked
