@@ -1,0 +1,7 @@
+# Runtime dependencies for the analytics connector container only.
+# Deliberately separate from the root requirements.txt (no LanceDB/OpenAI/bot SDK).
+fastmcp==4.1.4
+py-key-value-aio[azure-tables]==0.4.6
+httpx>=0.27,<0.28
+python-dotenv>=1.0,<2.0
+PyYAML>=6.0,<7.0
