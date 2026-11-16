@@ -148,6 +148,14 @@ def test_dev_no_auth_allowed_on_localhost():
     assert _settings(base_url="http://localhost:8000", dev_no_auth=True).validate()
 
 
+def test_azure_tables_async_transport_installed():
+    # The production OAuth store uses azure.data.tables.aio, which needs aiohttp
+    # at runtime; a missing transport only shows up as a 500 on the first sign-in.
+    pytest.importorskip("azure.data.tables")
+    import aiohttp  # noqa: F401
+    from azure.data.tables.aio import TableClient  # noqa: F401
+
+
 # --- report ----------------------------------------------------------------
 
 

@@ -2,6 +2,9 @@
 # Deliberately separate from the root requirements.txt (no LanceDB/OpenAI/bot SDK).
 fastmcp==4.1.4
 py-key-value-aio[azure-tables]==0.4.6
+# The async Azure Tables client (azure.data.tables.aio) needs aiohttp as its
+# transport, but neither package declares it. Without it every OAuth call 500s.
+aiohttp>=3.11,<4
 httpx>=0.27,<0.28
 python-dotenv>=1.0,<2.0
 PyYAML>=6.0,<7.0
