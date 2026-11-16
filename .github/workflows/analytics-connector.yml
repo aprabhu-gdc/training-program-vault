@@ -8,7 +8,9 @@ name: Analytics connector
 
 on:
   push:
-    branches: [main]
+    # The feature branch builds images without touching main (pushing to main
+    # also redeploys the Teams bot App Service). Deploy still runs on main only.
+    branches: [main, feat/claude-analytics-connector]
     paths:
       - "apps/analytics_mcp/**"
       - "packages/wiki_core/analytics/**"
