@@ -93,6 +93,17 @@ class SharePointListClient:
                 "for SharePoint analytics."
             )
 
+    def set_list_id(self, list_name: str, list_id: str) -> None:
+        """Pin a list's id so it is never looked up by name.
+
+        Needed when the app is granted access to individual lists only
+        (``Lists.SelectedOperations.Selected``): it can read and write those
+        lists but cannot enumerate the site's lists to find them by name.
+        """
+
+        if list_id.strip():
+            self._list_ids[list_name] = list_id.strip()
+
     def create_item(self, list_name: str, fields: dict[str, Any]) -> None:
         """Append one row to the named list. Raises on any Graph error."""
 
@@ -102,6 +113,42 @@ class SharePointListClient:
         )
         response = self._request("POST", url, json={"fields": fields})
         response.raise_for_status()
+
+    def list_items(
+        self,
+        list_name: str,
+        fields: tuple[str, ...],
+        *,
+        page_size: int = 500,
+        max_items: int = 50_000,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Read every row of the named list, following Graph paging.
+
+        Returns ``(rows, truncated)`` where each row is the item's ``fields``
+        dict restricted to ``fields``, and ``truncated`` is True when
+        ``max_items`` stopped the read early. Raises on any Graph error.
+        """
+
+        select = ",".join(fields)
+        url: str | None = (
+            f"{self.GRAPH_BASE_URL}/sites/{self._site_id()}"
+            f"/lists/{self._list_id(list_name)}/items"
+            f"?$expand=fields($select={select})&$top={page_size}"
+        )
+        rows: list[dict[str, Any]] = []
+        while url:
+            response = self._request("GET", url)
+            response.raise_for_status()
+            payload = response.json()
+            for item in list(payload.get("value") or []):
+                item_fields = item.get("fields") if isinstance(item, dict) else None
+                if isinstance(item_fields, dict):
+                    rows.append({name: item_fields.get(name) for name in fields})
+                    if len(rows) >= max_items:
+                        return rows, True
+            next_link = payload.get("@odata.nextLink")
+            url = str(next_link) if next_link else None
+        return rows, False
 
     def ensure_list(self, list_name: str, columns: tuple[dict[str, Any], ...]) -> bool:
         """Create the list with the given columns if it does not exist.
